@@ -484,14 +484,27 @@ it if your desktop does not already provide it.
 `DOT_SAGE=$PWD/.sagehome/.sage`.  That is an environment detail, not an
 application requirement.
 
+## Platform support
+
+* **Linux (x11 + Wayland)** — the supported platform.  Everything in this
+  README is tested here, on real Sage 10.10, through the native zenity error
+  dialogs and the xdg-portal file dialogs.
+* **macOS (Apple Silicon)** — best effort.  It compiles and passes the same
+  test suite in CI, but it has **not** been runtime-tested on real hardware:
+  the AppKit panels, the signed .app cold start, and Retina rendering are
+  unverified.  No .app bundle or signing setup is provided yet.
+* **Windows** — unsupported.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on `macos-14` (arm64) and `ubuntu-22.04` with
 native builds.  It runs formatting, clippy, `cargo test --all-targets` (backend,
 cells, fake-driver integration, headless egui workspace, M3 math/SVG/PNG, and M4
-inspector/menu tests) and a release build of both binaries.  The native error
-dialogs and GUI are smoke-tested manually; wgpu/eframe cannot be cross-compiled
-to `aarch64-apple-darwin` from Linux.
+inspector/menu tests) and a release build of both binaries.  The release
+binaries are uploaded as per-OS artifacts so each platform can be smoke-tested
+without a local toolchain.  The native error dialogs and GUI are smoke-tested
+manually; wgpu/eframe cannot be cross-compiled to `aarch64-apple-darwin` from
+Linux.
 
 ## Milestones
 
@@ -512,6 +525,8 @@ empty vector).
 
 ## License
 
-MIT OR Apache-2.0.  SageMath itself is not distributed here.  The embedded
-KaTeX TTFs come from `ratex-katex-fonts` and remain under the SIL Open Font
-License; see that crate's `FONT_NOTICE.txt` and `OFL.txt`.
+MIT OR Apache-2.0; see [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).  SageMath itself is not distributed here.
+The embedded KaTeX TTFs come from `ratex-katex-fonts` and remain under the
+SIL Open Font License; the notice and license are vendored at
+[third_party/katex-fonts/](third_party/katex-fonts/).

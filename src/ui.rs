@@ -111,13 +111,16 @@ impl SyntaxAssets {
     pub fn new() -> Self {
         let syntaxes = SyntaxSet::load_defaults_newlines();
         let themes = ThemeSet::load_defaults();
+        // Prefer a light theme to match the light UI, then any theme, then
+        // syntect's Default-derived empty theme.  A missing theme here must
+        // degrade to unhighlighted text, never panic the app at startup.
         let theme = themes
             .themes
             .get("InspiredGitHub")
             .or_else(|| themes.themes.get("base16-ocean.light"))
             .or_else(|| themes.themes.values().next())
             .cloned()
-            .expect("syntect ships default themes");
+            .unwrap_or_default();
         Self { syntaxes, theme }
     }
 

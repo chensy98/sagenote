@@ -562,8 +562,14 @@ fn run_with_timeout(program: &Path, args: &[&str], timeout: Duration) -> std::io
     // Validation must not leave a shell-wrapper child behind if it hangs.
     command.process_group(0);
     let mut child = command.spawn()?;
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
+    // Both pipes were requested above, so take() can only fail if the spawn
+    // somehow dropped them.  Kill and reap the child rather than panicking
+    // inside the GUI's startup path.
+    let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::other("child pipes were not piped"));
+    };
     let stdout_thread = std::thread::spawn(move || {
         let mut data = Vec::new();
         let _ = stdout.read_to_end(&mut data);
@@ -584,6 +590,10 @@ fn run_with_timeout(program: &Path, args: &[&str], timeout: Duration) -> std::io
         if started.elapsed() >= timeout {
             timed_out = true;
             let pid = child.id() as i32;
+            // SAFETY: libc::kill only reads its arguments, which are valid:
+            // SIGKILL is a libc constant and the child was spawned with
+            // process_group(0), so -pid names the group we created.  Nothing
+            // is borrowed across the call, so no aliasing is possible.
             unsafe {
                 libc::kill(-pid, libc::SIGKILL);
             }

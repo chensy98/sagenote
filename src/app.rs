@@ -409,7 +409,13 @@ impl App {
         self.startup_cancel = Arc::clone(&cancel_slot);
         self.startup_abort = Arc::new(AtomicBool::new(false));
         let abort = Arc::clone(&self.startup_abort);
-        let handle = self.tokio_handle.as_ref().expect("tokio handle").clone();
+        // A missing runtime handle means the app is being torn down; starting
+        // Sage from here would leak the process group past Drop.
+        let Some(handle) = self.tokio_handle.clone() else {
+            self.starting = false;
+            self.startup_rx = None;
+            return;
+        };
 
         match mode {
             StartupMode::Restart => {
@@ -1726,6 +1732,11 @@ impl Drop for App {
         if let Some(handle) = self.startup_pgid.lock().expect("pgid mutex").take() {
             let pid = handle.load(Ordering::SeqCst);
             if pid > 0 {
+                // SAFETY: libc::kill only reads its two arguments, and both
+                // are valid: SIGKILL is a libc constant, and the pgid was
+                // stored by the supervisor after a successful spawn, so the
+                // negative id names a process group we created.  Nothing is
+                // borrowed across the call, so no aliasing is possible.
                 unsafe {
                     libc::kill(-pid, libc::SIGKILL);
                 }

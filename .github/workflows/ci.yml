@@ -51,6 +51,18 @@ jobs:
       - name: Build both binaries
         run: cargo build --release --locked
 
+      # Uploading the release binaries per OS lets each platform be
+      # smoke-tested (manually, per README "Platform support") without a
+      # local toolchain.
+      - name: Upload release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: sagenote-${{ matrix.os }}
+          path: |
+            target/release/sagenote
+            target/release/sadrive
+          if-no-files-found: error
+
       - name: Smoke-test framing without Sage
         run: |
           ./target/release/sadrive --fake-driver -e latex -e raise -e '1+1' --introspect

@@ -370,9 +370,14 @@ state is a tinted pill.  The About dialog reports M4 and the shortcut set.
 
 ## 10. Platforms
 
-Linux (x11 + wayland) and macOS Apple Silicon.  Both Unix: signals, process
-groups and atomic rename are shared.  Divergences live in `platform.rs` with
-`cfg`, not a `trait Platform`:
+Linux (x11 + wayland) is the supported platform; macOS (Apple Silicon) is
+best effort — it compiles and passes CI, but has not been runtime-tested on
+real hardware.  Windows is unsupported.  Everything below is verified on Linux
+with real Sage 10.10, through native zenity error dialogs and xdg-portal file
+dialogs.
+
+Both targets are Unix: signals, process groups and atomic rename are shared.
+Divergences live in `platform.rs` with `cfg`, not a `trait Platform`:
 
 * driver location: `std::env::temp_dir()/sagenote-<pid>/driver.py`
   (`$XDG_RUNTIME_DIR` does not exist on macOS)

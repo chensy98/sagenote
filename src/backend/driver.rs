@@ -1192,6 +1192,11 @@ fn kill_group(pid: i32, signal: i32) {
     }
     // Negative pid = process group.  child.kill() would be SIGKILL and would
     // destroy the session; this is the only interrupt mechanism.
+    // SAFETY: libc::kill only reads its arguments, which are valid: the signal
+    // is a libc constant supplied by the caller, and the pid was stored by the
+    // supervisor after a successful spawn, so the negative id names a group we
+    // created.  Nothing is borrowed across the call, so no aliasing is
+    // possible.
     unsafe {
         libc::kill(-pid, signal);
     }
