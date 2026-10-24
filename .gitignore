@@ -1,0 +1,45 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+*.dSYM/
+
+# Local toolchain/test homes used by this workspace
+/.cargo-home/
+/.sagehome/
+/.probe/
+
+# Notebook atomic-save and editor temporaries
+*.sagenote.tmp-*
+*.tmp
+*.orig
+*.rej
+
+# Python driver caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Logs and local environment files
+*.log
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Coverage and profiling
+/coverage/
+*.profraw
+*.profdata
