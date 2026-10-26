@@ -8,7 +8,7 @@
 //!   2. `~/.config/sagenote/config.toml`
 //!   3. `PATH`
 //!   4. macOS `/Applications/SageMath*.app` and `~/Applications/...`
-//!   5. the GUI's browse button (M4) calls [`validate_sage`] and writes config.
+//!   5. the GUI's browse button calls [`validate_sage`] and writes config.
 //!
 //! Every candidate is validated by **executing** `<candidate> --version`.  We
 //! never use `which` or a file test to decide whether Sage is installed: a
@@ -289,7 +289,7 @@ pub fn discover_sage() -> std::result::Result<SageInstall, DiscoveryError> {
         });
     }
 
-    // 5. Browse is a UI action (M4).  It has not been attempted yet.
+    // 5. Browse is a UI action.  It has not been attempted yet.
     attempts.push(DiscoveryFailure {
         stage: "browse",
         candidate: "(not attempted)".into(),

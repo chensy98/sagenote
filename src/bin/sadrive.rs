@@ -1,8 +1,8 @@
-//! `sadrive` — M1 headless probe for the Sage stdio driver.
+//! `sadrive` — headless probe for the Sage stdio driver.
 //!
 //! It discovers/spawns Sage, evaluates cells, prints the typed frame stream,
 //! exercises SIGINT and the watchdog, and notices a driver that dies mid-cell.
-//! There is intentionally no GUI in this binary; that is M2.
+//! There is intentionally no GUI in this binary; the GUI lives in the sagenote binary.
 //!
 //! Examples:
 //!   cargo run --bin sadrive
@@ -11,7 +11,7 @@
 //!   cargo run --bin sadrive -- -e 'ignore-sigint' --interrupt-after 1 --interrupt-timeout 2
 //!   cargo run --bin sadrive -- -e 'import os; os._exit(9)'
 //!
-//! Over SSH/llvmpipe the eventual GUI needs WGPU_BACKEND=gl; M1 has no wgpu.
+//! Over SSH/llvmpipe the GUI needs WGPU_BACKEND=gl; this binary has no wgpu.
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -733,7 +733,7 @@ fn seconds(value: &str) -> Result<Duration, String> {
 
 fn print_help() {
     println!(
-        r##"sadrive — headless Sage driver probe (M1)
+        r##"sadrive — headless Sage driver probe
 
 USAGE:
     sadrive [OPTIONS] [SCRIPT]

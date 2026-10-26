@@ -147,7 +147,7 @@ pub enum BackendEvent {
     },
     /// A fresh process finished the ready handshake and the preamble.
     Restarted { sage_version: String },
-    /// Placeholder completion channel. M1 emits an empty vector.
+    /// Placeholder completion channel. Emits an empty vector.
     Completion {
         cell: CellId,
         offset: usize,

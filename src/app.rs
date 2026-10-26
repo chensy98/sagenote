@@ -1,6 +1,6 @@
 //! GUI application state: notebook, cell runtimes, background Sage startup,
-//! event routing, file lifecycle, M4 inspector state, native error dialogs and
-//! the M3 renderer cache.  The cell workspace itself lives in [`crate::ui`];
+//! event routing, file lifecycle, inspector state, native error dialogs and
+//! the renderer cache.  The cell workspace itself lives in [`crate::ui`];
 //! this file owns state and side effects.
 
 use std::collections::HashMap;
@@ -684,7 +684,7 @@ impl App {
         });
     }
 
-    /// M4 error UI: a native rfd/AppKit/zenity message box.  Recovery dialogs
+    /// Error UI: a native rfd/AppKit/zenity message box.  Recovery dialogs
     /// use Retry / Browse / Keep editing; informational errors are a single OK.
     /// The in-window banner remains the fallback when a desktop has no native
     /// message provider (rfd returns Cancel in that case).
@@ -1592,10 +1592,7 @@ impl App {
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(6.0);
-            ui.label(format!(
-                "Milestone M4 — version {}",
-                env!("CARGO_PKG_VERSION")
-            ));
+            ui.label(format!("sagenote — version {}", env!("CARGO_PKG_VERSION")));
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new("Shift+Enter run  ·  Ctrl/⌘ I variables  ·  Ctrl/⌘ S save")

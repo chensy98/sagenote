@@ -1,5 +1,5 @@
-//! Cell workspace, menu/status bars, the M4 variable inspector, the syntect-based
-//! Rust-native editor, and the M3 output panel (RaTeX/SVG/PNG + text fallbacks).
+//! Cell workspace, menu/status bars, the variable inspector, the syntect-based
+//! Rust-native editor, and the output panel (RaTeX/SVG/PNG + text fallbacks).
 //!
 //! Why not `egui_code_editor`?  The current release (0.4.2) pins egui 0.36
 //! while this app uses eframe/egui 0.31.1, and it ships its own highlighter

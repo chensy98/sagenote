@@ -383,7 +383,7 @@ pub fn save_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
-/// Minimal RFC3339 UTC timestamp; avoids pulling a date crate into M1.
+/// Minimal RFC3339 UTC timestamp; avoids pulling a date crate.
 fn utc_now_rfc3339() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)

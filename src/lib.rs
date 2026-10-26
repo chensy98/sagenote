@@ -7,8 +7,8 @@
 //! * [`cells`] — the notebook/cell model and its codecs.
 //! * [`platform`] — Sage discovery and the few OS-specific paths.
 //!
-//! The `sagenote` binary adds the eframe `app`/`ui` modules, the M3 `render`
-//! module and the M4 inspector/native-error state; those depend on
+//! The `sagenote` binary adds the eframe `app`/`ui` modules, the `render`
+//! module and the inspector/native-error state; those depend on
 //! `eframe`/`egui`.  Nothing in this crate (backend, cells, platform) knows
 //! they exist, which keeps `sadrive` headless.
 

@@ -1,4 +1,4 @@
-//! M3 output renderer: RaTeX math, SVG and PNG.
+//! Output renderer: RaTeX math, SVG and PNG.
 //!
 //! Everything that turns a MIME payload into an egui texture lives here.  The
 //! backend and notebook model stay windowing-free; the UI only calls the small

@@ -1,4 +1,4 @@
-//! eframe entry point for the desktop app (M2 shell, M3 rendering, M4 inspector).
+//! eframe entry point for the desktop app for the desktop app.
 //!
 //! wgpu is explicit: eframe's default renderer is glow, and this project needs
 //! wgpu (Metal on Apple Silicon, Vulkan/GL on Linux).  Use `WGPU_BACKEND=gl`
