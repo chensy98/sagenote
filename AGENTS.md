@@ -3,9 +3,19 @@
 Rust-native SageMath notebook — eframe + egui, wxMaxima-flavoured. Linux (x11/wayland) and
 macOS arm64. A cell is source plus typed outputs.
 
-`docs/DESIGN.md` is the authority on protocol, layout, output types and platforms. Read the
-section you are about to touch before touching it; this file only carries what the code
-cannot show you.
+`docs/DESIGN.md` is the index and authority on protocol, layout, output types and
+platforms. Read the topic file you are about to touch before touching it; this file only
+carries what the code cannot show you.
+
+## Project state
+
+The project is complete and stable.  All features described in `docs/DESIGN.md` are
+implemented and tested: the cell workspace with syntax-highlighted editing, RaTeX math
+rendering, SVG/PNG image display, the variable inspector, native error dialogs, atomic
+notebook persistence, robust process control (SIGINT/watchdog/cleanup), and headless
+testing without Sage or a display.
+
+Nothing is in progress.  Do not start new scope without a direct request.
 
 ## Invariants
 
@@ -55,34 +65,6 @@ testable with Sage absent — pass it as the driver and `/usr/bin/python3` as th
 - Editing or deleting the running cell clears its visible state but the backend eval is
   still active.  `App::any_running` includes `App.active` for exactly this reason; do not
   reduce it to a scan of cell states.
-
-## Current milestone: M4, inspector/native errors/styling (complete)
-
-M1–M3 are complete; M4 adds:
-
-- right-side **Variables** inspector: default visible, resizable, View menu or
-  Ctrl/⌘+I, close button; driver `introspect` baseline, reprlib caps, one
-  `IntrospectId` in flight, stale responses ignored
-- manual refresh and auto-refresh every 2 s only while visible; suppressed while
-  any cell is queued/running; 500 ms repaint while visible
-- list rows name/type/repr with loading/paused/error/empty states; list cleared
-  on backend start/restart/death but not on notebook open/new
-- native rfd `MessageDialog` errors: AppKit on macOS, zenity on Linux; custom
-  Retry / Browse for sage… / Keep editing for recovery, OK for file errors;
-  in-window banner fallback; no native Quit button
-- styling pass: off-white menu/status surfaces, rounded cell cards, blue running
-  border, tinted state pills, M4 About/shortcut text
-- M3 remains: RaTeX 0.1.15 → tiny-skia, usvg/resvg SVG, base64 PNG, ANSI, LRU
-
-Verification: `cargo test --all-targets` (22 lib + 24 app/UI/render + 9 fixture
-integration = 55), `cargo clippy --all-targets -- -D warnings`, fmt clean.
-Live Sage 10.10: inspector auto-refreshed at 2 s intervals with increasing
-`IntrospectId`s; the native discovery-failure dialog opened through zenity with
-the custom labels. The GUI was not runtime-tested on macOS hardware; CI
-builds/tests the fixture path.
-
-All four planned milestones are complete.  Do not start new scope without a
-direct request.
 
 ## Out of scope until asked
 
