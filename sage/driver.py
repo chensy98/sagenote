@@ -22,10 +22,12 @@ cells and marks them Interrupted.  Per-cell cancellation needs a Jupyter kernel
 
 import ast
 import base64
+import inspect
 import io
 import json
 import os
 import reprlib
+import rlcompleter
 import sys
 import traceback
 
@@ -38,6 +40,7 @@ os.dup2(_DEVNULL, 1)
 os.close(_DEVNULL)
 
 from sage.all import *
+
 _baseline = set(globals())
 # The set is created after the assignment, so `_baseline` itself is not in it.
 _baseline.add("_baseline")
@@ -67,7 +70,9 @@ def _cap(text, limit=_PAYLOAD_LIMIT):
     if len(text) <= limit:
         return text
     omitted = len(text) - limit
-    return text[:limit] + "\n[... sagenote driver: truncated %d characters ...]" % omitted
+    return (
+        text[:limit] + "\n[... sagenote driver: truncated %d characters ...]" % omitted
+    )
 
 
 def _write_all(data):
@@ -127,7 +132,10 @@ class _CappedBuffer(io.StringIO):
         self.seek(0)
         self.truncate(0)
         if self._omitted:
-            text += "\n[... sagenote driver: truncated %d stream characters ...]" % self._omitted
+            text += (
+                "\n[... sagenote driver: truncated %d stream characters ...]"
+                % self._omitted
+            )
             self._omitted = 0
         return text
 
@@ -151,6 +159,7 @@ def _drain_streams():
 def _version_string():
     try:
         import sage.version as sage_version
+
         return str(sage_version.version)
     except Exception:
         try:
@@ -168,6 +177,7 @@ def _source_init():
     global _startup_error
     try:
         from sage.env import SAGE_STARTUP_FILE
+
         if not SAGE_STARTUP_FILE or not os.path.isfile(SAGE_STARTUP_FILE):
             return
         with open(SAGE_STARTUP_FILE, "rb") as handle:
@@ -324,6 +334,7 @@ def _format_value(obj):
 def _preparse(source):
     try:
         from sage.repl.preparse import preparse as sage_preparse
+
         return sage_preparse(source)
     except Exception:
         # Keep the driver usable on a Sage too old/new to expose preparse; the
@@ -395,6 +406,15 @@ def _run(cell_id, run_id, source):
         _send({"type": "end", "id": cell_id, "run": run_id})
 
 
+def _is_display_manager(value):
+    """Sage's `dm` is machinery set up by init.sage, not a user variable.
+
+    It is a `DisplayManager` and only confuses the inspector/completion, so it
+    is filtered from both.  Ordinary user variables of other types are kept.
+    """
+    return type(value).__name__ == "DisplayManager"
+
+
 def _introspect(request_id):
     _use_capture_buffers()
     formatter = reprlib.Repr()
@@ -409,14 +429,14 @@ def _introspect(request_id):
             continue
         try:
             value = _user_ns[name]
+            if _is_display_manager(value):
+                continue
             type_name = type(value).__name__
             shown = formatter.repr(value)
         except Exception as exc:
             type_name = "?"
             shown = "<sagenote: repr failed: %r>" % (exc,)
-        variables.append(
-            {"name": name, "type": type_name, "value": _cap(shown, 4000)}
-        )
+        variables.append({"name": name, "type": type_name, "value": _cap(shown, 4000)})
         if len(variables) >= 1000:
             break
     _drain_streams()
@@ -432,12 +452,146 @@ def _set_display(message):
     # text/latex bundle, so the UI does not depend on IPython magic state.
 
 
+def _completion_token(text):
+    """The dotted identifier ending at the end of `text`.
+
+    Mirrors `completion_token_start` in src/ui.rs: identifiers may contain
+    letters, digits, underscores and dots, so `a.bi` is completed as a whole.
+    """
+    token = []
+    for ch in reversed(text):
+        if ch.isalnum() or ch == "_" or ch == ".":
+            token.append(ch)
+        else:
+            break
+    return "".join(reversed(token))
+
+
+def _complete(message):
+    """Prefix/attribute completion for one Tab press.
+
+    rlcompleter gives us the IDE feel for free: globals, keywords, Python
+    builtins and attributes, with `(` appended to callables.  It is advisory
+    and must never raise, so every probe is wrapped.
+    """
+    cell_id = message.get("id")
+    source = message.get("source", "") or ""
+    _use_capture_buffers()
+    try:
+        offset = int(message.get("offset", 0))
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(0, min(offset, len(source)))
+    token = _completion_token(source[:offset])
+
+    items = []
+    if token and not token.startswith("."):
+        # Hide driver internals and Sage's dunder soup unless the user is
+        # explicitly completing a private name.
+        private = token.rsplit(".", 1)[-1].startswith("_")
+        namespace = {
+            name: value
+            for name, value in _user_ns.items()
+            if (private or not name.startswith("_")) and not _is_display_manager(value)
+        }
+        try:
+            completer = rlcompleter.Completer(namespace)
+            state = 0
+            while len(items) < 200:
+                try:
+                    item = completer.complete(token, state)
+                except Exception:
+                    break
+                if item is None:
+                    break
+                if item and item not in items:
+                    items.append(item)
+                state += 1
+        except Exception:
+            items = []
+
+    items.sort()
+    # Attribute probing can technically print (a hostile __getattr__); that is
+    # not cell output, so discard it rather than leaking it into the next run.
+    _stdout.take()
+    _stderr.take()
+    _send({"type": "complete", "id": cell_id, "offset": offset, "items": items})
+
+
+def _docs(message):
+    """Documentation for the dotted identifier ending at the caret.
+
+    The UI renders the plain docstring; keeping the transport text-only means
+    no HTML/WebView is involved.  Resolution and docstring access are wrapped:
+    a user object with a hostile descriptor must not break the driver.
+    """
+    cell_id = message.get("id")
+    source = message.get("source", "") or ""
+    _use_capture_buffers()
+    try:
+        offset = int(message.get("offset", 0))
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(0, min(offset, len(source)))
+    token = _completion_token(source[:offset])
+    name = token
+    type_name = ""
+    signature = ""
+
+    if not token:
+        text = "Place the caret on a name to see its documentation."
+    else:
+        try:
+            if "." in token:
+                obj = eval(token, _user_ns)
+            else:
+                obj = _user_ns.get(token)
+        except Exception as exc:
+            text = "Could not resolve `%s`: %r" % (token, exc)
+        else:
+            if obj is None:
+                text = "No documentation found for `%s`." % token
+            else:
+                type_name = type(obj).__name__
+                try:
+                    text = inspect.getdoc(obj) or ""
+                except Exception:
+                    text = ""
+                if not text:
+                    try:
+                        text = "No docstring.\n\nrepr:\n" + repr(obj)
+                    except Exception:
+                        text = "No documentation found for `%s`." % token
+                try:
+                    signature = str(inspect.signature(obj))
+                except Exception:
+                    signature = ""
+
+    _stdout.take()
+    _stderr.take()
+    _send(
+        {
+            "type": "doc",
+            "id": cell_id,
+            "offset": offset,
+            "name": name,
+            "kind": type_name,
+            "signature": signature,
+            "text": _cap(text, 40000),
+        }
+    )
+
+
 def _dispatch(message):
     op = message.get("op")
     if op == "eval":
         _run(message["id"], message["run"], message.get("source", ""))
     elif op == "introspect":
         _introspect(message["id"])
+    elif op == "complete":
+        _complete(message)
+    elif op == "doc":
+        _docs(message)
     elif op == "set_display":
         _set_display(message)
     elif op == "ping":
@@ -497,7 +651,9 @@ def main():
                 {
                     "type": "stream",
                     "name": "stderr",
-                    "text": _cap("[sagenote driver: request failed]\n" + traceback.format_exc()),
+                    "text": _cap(
+                        "[sagenote driver: request failed]\n" + traceback.format_exc()
+                    ),
                 }
             )
 

@@ -75,6 +75,10 @@ pub struct Cell {
     pub outputs: Vec<SavedOutput>,
     #[serde(default)]
     pub state: CellState,
+    /// Jupyter-style execution count shown in the `In [n]:` prompt.
+    /// `None` means the cell has never been run in any session.
+    #[serde(default)]
+    pub execution_count: Option<u64>,
 }
 
 impl Cell {
@@ -84,6 +88,7 @@ impl Cell {
             source: source.into(),
             outputs: Vec::new(),
             state: CellState::Idle,
+            execution_count: None,
         }
     }
 
@@ -93,6 +98,7 @@ impl Cell {
             source: source.into(),
             outputs: Vec::new(),
             state: CellState::Idle,
+            execution_count: None,
         }
     }
 }

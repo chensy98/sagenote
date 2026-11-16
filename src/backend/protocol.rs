@@ -133,6 +133,25 @@ pub enum Frame {
         id: IntrospectId,
         vars: Vec<VarInfo>,
     },
+    /// Prefix-completion candidates for the token ending at `offset` in the
+    /// source sent with `{"op":"complete"}`.  `id` echoes the cell id.
+    Complete {
+        id: CellId,
+        offset: usize,
+        items: Vec<String>,
+    },
+    /// Documentation for the name at `offset` in the source sent with
+    /// `{"op":"doc"}`.  `text` is the plain docstring; the UI renders it.
+    Doc {
+        id: CellId,
+        offset: usize,
+        name: String,
+        #[serde(default, rename = "kind")]
+        type_name: String,
+        #[serde(default)]
+        signature: String,
+        text: String,
+    },
     End {
         id: CellId,
         run: RunId,
@@ -176,6 +195,20 @@ pub enum DriverRequest<'a> {
     },
     Introspect {
         id: IntrospectId,
+    },
+    /// Ask for Tab-completion candidates.  `source` is the whole cell and
+    /// `offset` is the caret position in characters; the driver extracts the
+    /// dotted identifier that ends there.
+    Complete {
+        id: CellId,
+        offset: usize,
+        source: &'a str,
+    },
+    /// Look up documentation for the dotted identifier ending at `offset`.
+    Doc {
+        id: CellId,
+        offset: usize,
+        source: &'a str,
     },
     SetDisplay {
         mode: DisplayMode,
@@ -305,5 +338,50 @@ mod tests {
             .unwrap(),
             r#"{"op":"set_display","mode":"inline"}"#
         );
+    }
+
+    #[test]
+    fn complete_frame_and_request_roundtrip() {
+        let f = Frame::Complete {
+            id: id(4),
+            offset: 7,
+            items: vec!["print(".into(), "println(".into()],
+        };
+        let line = f.to_json_line().unwrap();
+        assert!(line.contains(r#""type":"complete""#));
+        assert_eq!(Frame::from_json_line(&line).unwrap(), f);
+
+        let r = DriverRequest::Complete {
+            id: id(4),
+            offset: 7,
+            source: "a = pri",
+        };
+        let line = r.to_json_line().unwrap();
+        assert!(line.contains(r#""op":"complete""#));
+        assert!(line.contains(r#""source":"a = pri""#));
+    }
+
+    #[test]
+    fn doc_frame_and_request_roundtrip() {
+        let f = Frame::Doc {
+            id: id(5),
+            offset: 3,
+            name: "plot".into(),
+            type_name: "function".into(),
+            signature: "plot(*args, **kwds)".into(),
+            text: "Plot a function.".into(),
+        };
+        let line = f.to_json_line().unwrap();
+        assert!(line.contains(r#""type":"doc""#));
+        assert!(line.contains(r#""kind":"function""#));
+        assert_eq!(Frame::from_json_line(&line).unwrap(), f);
+
+        let r = DriverRequest::Doc {
+            id: id(5),
+            offset: 3,
+            source: "plo",
+        };
+        let line = r.to_json_line().unwrap();
+        assert!(line.contains(r#""op":"doc""#));
     }
 }

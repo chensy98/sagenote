@@ -7,10 +7,22 @@
 - discovery version parsing/natural sort, validation by execution
 - supervisor integration against `tests/fixtures/fake_driver.py`:
   ready/start/stream/result/end, error/end, SIGINT recovery, watchdog restart,
-  mid-cell death, queued-cell drop, introspection, empty completion
+  mid-cell death, queued-cell drop, introspection, completion, documentation
 - headless egui passes: the cell workspace, menu bar and status bar render via
   `egui::Context::run`; a synthesized Shift+Enter reaches the app and queues a
   Run; saved outputs are stale in the runtime projection
+- completion: token extraction across dotted identifiers and Unicode, and the
+  pure replace-and-place-caret helper; the fixture driver answers `complete`
+  with canned candidates and the supervisor routes them as `Completion`
+- documentation: the fixture driver answers `doc` and the supervisor forwards
+  the `Frame::Doc`; the app's prose/code/heading formatter renders headlessly
+- manual: against real Sage 10.10, `sadrive --introspect` hides the
+  `DisplayManager` `dm` from `init.sage`, and `sadrive --docs` returns the
+  `plot` docstring
+- theming: the Carbon light/dark palettes are distinct and contrast their text
+  against the canvas; the central panel uses the Carbon fill rather than the
+  window clear colour; the bundled IBM Plex families are registered and render
+  (UI frames render with the palette applied)
 - rendering: RaTeX `x^2 + \frac{1}{2}` produces non-empty premultiplied
   pixels; invalid LaTeX returns the source fallback; a rectangle SVG and a 1×1
   PNG decode; the texture cache returns the same handle; mixed rich outputs
@@ -18,8 +30,7 @@
 - manual: a real Sage 10.10 `plot(sin(x), ...)` SVG was rendered with the
   same usvg/resvg/fontdb path; labels require the system font database
 - the inspector panel renders headlessly with variables and with an empty
-  loading state; age formatting is unit-tested; the menu/status bar include the
-  Inspector entries
+  loading state; the menu/status bar include the Inspector entries
 - manual: the live app auto-refreshed the inspector at 2 s intervals against
   Sage 10.10 (increasing `IntrospectId`s); the native discovery-failure dialog
   opened through zenity with Retry / Browse / Keep-editing labels
@@ -37,4 +48,4 @@ cargo test --test driver_integration # fixture integration only
 
 ## Test count
 
-55 total: 22 lib + 24 app/UI/render + 9 fixture-integration.
+70 total: 24 lib + 36 app/UI/render + 10 fixture-integration.

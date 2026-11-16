@@ -16,15 +16,22 @@ SageMath.
 - [docs/PLATFORMS.md](docs/PLATFORMS.md) — Linux/macOS differences, building
 - [docs/TESTING.md](docs/TESTING.md) — test structure, coverage
 - [docs/DESIGN.md](docs/DESIGN.md) — index and non-negotiables
+- [CHANGELOG.md](CHANGELOG.md) — release notes
 
 ## Features
 
 - **Cell workspace** — scrollable, syntax-highlighted Sage cells with
   Run / Run All / Run Above, move, insert, delete
+- **IBM Carbon UI** — light by default, Carbon dark available; embedded IBM
+  Plex Sans/Mono, square corners, hairline borders, Blue 60 focus
+- **Tab completion** — driver-side namespace/attribute completion with a
+  compact, keyboard-navigable popup (Ctrl+N/Ctrl+P)
+- **Inline documentation** — Ctrl+Space opens a formatted docstring window
+  (inspect.getdoc; no WebView)
 - **Math rendering** — native RaTeX (Rust KaTeX) for `text/latex`,
   usvg/resvg for SVG, and the image crate for PNG
-- **Variable inspector** — resizable right panel listing user variables with
-  type and bounded repr, auto-refreshing every 2 s while visible
+- **Variable inspector** — compact, resizable right panel listing user
+  variables with type and bounded repr, auto-refreshing every 2 s while visible
 - **Native error dialogs** — zenity on Linux, AppKit on macOS; custom
   Retry / Browse / Keep-editing buttons for recovery
 - **Notebook persistence** — atomic `.sagenote` saves with dirty tracking,
@@ -74,7 +81,7 @@ printed and will be shown in the status bar.
 `python3`:
 
 ```sh
-cargo run --bin sadrive -- --fake-driver -e latex -e raise -e '1+1' --introspect
+cargo run --bin sadrive -- --fake-driver -e latex -e raise -e '1+1' --introspect --docs
 cargo run --bin sadrive -- --fake-driver -e hang --interrupt-after 0.5 -e '1+1'
 cargo run --bin sadrive -- --fake-driver -e ignore-sigint --interrupt-after 0.5 --interrupt-timeout 1
 cargo run --bin sadrive -- --fake-driver -e die
@@ -102,15 +109,17 @@ WGPU_BACKEND=gl cargo run --release
   `egui_code_editor` release pins egui 0.36 and ships its own highlighter instead
   of accepting a caller-supplied `syntect::SyntaxSet`, so the fallback is used.
   Shift+Enter is consumed before the editor sees it; bare Enter inserts a
-  newline.
+  newline.  Tab asks the driver for prefix/attribute completions: one candidate
+  is inserted, several open a compact, keyboard-navigable popup.  Ctrl+Space
+  opens a formatted docstring window for the name at the caret.
 - Per-cell state inline: idle / queued / running / ok + elapsed / error /
   interrupted.
 - Buttons: Run, insert below, move up, move down, delete.  A bottom
   "＋ Add cell" appends.  Menus: **Run All**, **Run Above**.  Run All and Run
   Above skip empty cells.  At most one cell is on the driver's stack; the
   supervisor queues the rest, and the UI shows them as queued.
-- Outputs live in a light-grey panel below the editor.  The text pipeline
-  renders plain text, stderr (orange), and full red tracebacks; the math
+- Outputs live in a Gray 10 Carbon panel below the editor.  The text pipeline
+  renders plain text, stderr (warning colour), and full red tracebacks; the math
   pipeline adds RaTeX math, SVG and PNG (below).  HTML/3D show the
   scope-limit placeholder.  Saved outputs are dirty-checked and greyed with a
   **stale** tag after load; a backend restart/death also stales every output,
@@ -127,10 +136,12 @@ WGPU_BACKEND=gl cargo run --release
 - Atomic save; title bar shows `sagenote — name *` while dirty.
 - Window close, **Quit**, ⌘/Ctrl+Q and ⌘/Ctrl+W go through one unsaved-changes
   modal (Save / Discard / Cancel).  Save failure keeps the notebook open.
-- Shortcuts all use `egui::Modifiers::COMMAND` (⌘ on macOS, Ctrl elsewhere):
-  Shift+Enter evaluate · Ctrl/⌘+N new · +O open · +S save · +Shift+S save as ·
-  +. interrupt · Ctrl/⌘+I inspector.  ⌘Q/⌘W are intercepted explicitly because
-  egui does not handle them; otherwise macOS could not quit from the keyboard.
+- Global shortcuts use `egui::Modifiers::COMMAND` (⌘ on macOS, Ctrl
+  elsewhere): Ctrl/⌘+N new · +O open · +S save · +Shift+S save as · +.
+  interrupt · Ctrl/⌘+I inspector.  Editor bindings are Shift+Enter evaluate,
+  Tab complete, Ctrl+Enter run in place, Alt+Enter run and insert below.
+  ⌘Q/⌘W are intercepted explicitly because egui does not handle them;
+  otherwise macOS could not quit from the keyboard.
 
 ### Startup and recovery
 
@@ -203,14 +214,17 @@ All rendering lives behind one wrapper, `src/render.rs`; the backend and
 - The app sends one `introspect` request per refresh.  The driver answers with
   `set(_user_ns) - _baseline` and a bounded `reprlib.Repr` (60-char strings, 20
   list/dict items, depth 3, 4000-char cap).  Only the user's names are shown;
-  Sage's own globals are excluded by the driver's baseline.
+  Sage's own globals are excluded by the driver's baseline, and
+  `DisplayManager` objects (the `dm` from `init.sage`) are filtered out.
 - One request in flight at a time.  A manual ↻ is available; auto-refresh runs
   every 2 s **only while the panel is visible**, and is suppressed while any cell
   is queued/running, including a backend eval that is still active after its
-  cell was edited or deleted.  The panel shows the count, "updated …", and
-  "auto 2 s"; responses with a stale `IntrospectId` are ignored.
-- Each row shows the name in monospace, the Python type, and the repr value.
-  Backend start/restart/death clears the list; opening another notebook does
+  cell was edited or deleted.  Responses with a stale `IntrospectId` are ignored.
+- The panel is deliberately concise: no permanent status line, no timestamp and
+  no per-entry boxes.  Each variable is one compact block (name + type, then
+  the repr) separated by spacing; starting/loading/error/empty are shown only
+  when there is no list to show.
+- Backend start/restart/death clears the list; opening another notebook does
   **not**, because the inspector describes the live Sage session, not the file.
 - Ctrl/⌘+I is consumed before the editor, so it cannot become italic text.
 
@@ -243,14 +257,19 @@ below).  Frames are one JSON object per line, Jupyter-shaped:
  "bundle":{"text/latex":"..."},"display":"block"}
 {"type":"error","id":"<uuid>","run":1,"traceback":"..."}
 {"type":"introspect","id":1,"vars":[{"name":"a","type":"Integer","value":"42"}]}
+{"type":"complete","id":"<uuid>","offset":7,"items":["print(","println("]}
+{"type":"doc","id":"<uuid>","offset":4,"name":"plot","kind":"function",
+ "signature":"plot(*args, **kwds)","text":"..."}
 {"type":"end","id":"<uuid>","run":1}
 {"type":"pong"}          # auxiliary answer to ping, never cell output
 ```
 
-Stdin is a stream of `{"op":"eval"|"introspect"|"set_display"|"ping", ...}`
+Stdin is a stream of `{"op":"eval"|"introspect"|"complete"|"doc"|"set_display"|"ping", ...}`
 objects.  `bundle` is always a mimetype map; `image/png` is base64, SVG/latex/
 plain are UTF-8.  `display` is the driver's `block`/`inline` decision, never
-inferred from the LaTeX string.
+inferred from the LaTeX string.  `complete` and `doc` carry the cell `source`
+and the caret `offset` (characters); the driver extracts the dotted identifier
+there.
 
 `sage/driver.py` is included in the binary with `include_str!` and written at
 startup to `std::env::temp_dir()/sagenote-<pid>/driver.py` (not
@@ -384,14 +403,16 @@ it if your desktop does not already provide it.
 
 ## Testing
 
-`cargo test --all-targets` runs 55 tests: 22 lib + 24 app/UI/render + 9
+`cargo test --all-targets` runs 70 tests: 24 lib + 36 app/UI/render + 10
 fixture-integration.  It covers protocol serde round-trips, unknown-frame
 tolerance, the notebook codec, stale-on-load, format version, atomic save, cell
 moves, discovery version parsing/natural sort, validation by execution,
 ready/start/stream/result/end, error/end, SIGINT recovery, watchdog restart,
-mid-cell death, queued-cell drop, introspection, empty completion, headless
-egui passes (cell workspace, menu bar, status bar, inspector panel, synthesized
-Shift+Enter), rendering (RaTeX math, SVG rectangle, 1×1 PNG, texture cache, ANSI
+mid-cell death, queued-cell drop, introspection, completion, documentation,
+headless egui passes (cell workspace, menu bar, status bar, inspector panel,
+synthesized Shift+Enter), completion token/insertion helpers, doc text
+formatting, Carbon palette contrast,
+rendering (RaTeX math, SVG rectangle, 1×1 PNG, texture cache, ANSI
 stripping, mixed rich outputs).
 
 `cargo clippy --all-targets -- -D warnings` must be clean.
@@ -402,9 +423,11 @@ stripping, mixed rich outputs).
 Cargo.toml
 src/main.rs             # eframe entry point (wgpu)
 src/app.rs              # App state, startup, event routing, files, modals
-src/ui.rs               # menu/status bar, cell workspace, syntect editor
+src/ui.rs               # menu/status bar, cell workspace, syntect editor, completion
 src/render.rs           # RaTeX/tiny-skia, usvg/resvg, PNG, texture cache
+src/settings.rs         # settings, keybindings, Carbon palette, bundled fonts
 src/text.rs             # ANSI stripping for displayed output
+assets/fonts/           # embedded IBM Plex Sans/Mono (SIL OFL 1.1)
 src/bin/sadrive.rs      # headless probe
 src/lib.rs
 src/backend/mod.rs      # EvalBackend, BackendEvent, ids, mimetypes
@@ -440,4 +463,7 @@ MIT OR Apache-2.0; see [LICENSE-MIT](LICENSE-MIT) and
 [LICENSE-APACHE](LICENSE-APACHE).  SageMath itself is not distributed here.
 The embedded KaTeX TTFs come from `ratex-katex-fonts` and remain under the
 SIL Open Font License; the notice and license are vendored at
-[third_party/katex-fonts/](third_party/katex-fonts/).
+[third_party/katex-fonts/](third_party/katex-fonts/).  The bundled UI typefaces
+(IBM Plex Sans/Mono in [assets/fonts/](assets/fonts/)) are Copyright IBM Corp.
+and are licensed under the SIL Open Font License 1.1; see
+[assets/fonts/OFL.txt](assets/fonts/OFL.txt).

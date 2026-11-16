@@ -7,11 +7,16 @@
 //! explicitly allows the fallback: `TextEdit::multiline` plus a syntect
 //! layouter.  That also makes Shift+Enter interception straightforward.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
-use eframe::egui::{self, Color32, FontId, Key, Modifiers, RichText, Stroke, TextStyle, Ui};
+use eframe::egui::text::{CCursor, CCursorRange};
+use eframe::egui::{
+    self, Color32, FontId, Key, Modifiers, Response, RichText, Stroke, TextStyle, Ui,
+};
 use sagenote::backend::{CellId, DisplayMode, MimeBundle, MimeType, StreamName, VarInfo};
 use sagenote::cells::{Cell, CellState, Notebook};
 use syntect::easy::HighlightLines;
@@ -21,14 +26,73 @@ use syntect::util::LinesWithEndings;
 
 use crate::app::{CellRuntime, LiveOutput};
 use crate::render::Renderer;
+use crate::settings::CarbonPalette;
 use crate::text::strip_ansi;
 
-const ERROR_RED: Color32 = Color32::from_rgb(178, 45, 45);
-const RUNNING_BLUE: Color32 = Color32::from_rgb(45, 95, 165);
-const STDERR_ORANGE: Color32 = Color32::from_rgb(168, 92, 25);
-const STALE_GREY: Color32 = Color32::from_gray(115);
-const OUTPUT_BG: Color32 = Color32::from_gray(245);
-const CELL_BORDER: Color32 = Color32::from_gray(222);
+/// Carbon semi-bold for headings/labels that need hierarchy.  egui's
+/// `strong()` only changes colour, which is invisible in the light palette.
+pub(crate) fn semibold(size: f32) -> egui::FontId {
+    egui::FontId::new(
+        size,
+        egui::FontFamily::Name(crate::settings::PLEX_SANS_SEMIBOLD.into()),
+    )
+}
+
+/// Carbon's primary action button: Blue 60 fill, white label, square.
+pub(crate) fn primary_button(ui: &mut Ui, label: impl Into<egui::WidgetText>) -> Response {
+    let p = CarbonPalette::of(ui);
+    ui.scope(|ui| {
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.weak_bg_fill = p.interactive;
+        widgets.inactive.bg_fill = p.interactive;
+        widgets.inactive.bg_stroke = Stroke::NONE;
+        widgets.inactive.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+        widgets.hovered.weak_bg_fill = p.interactive_hover;
+        widgets.hovered.bg_fill = p.interactive_hover;
+        widgets.hovered.bg_stroke = Stroke::NONE;
+        widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+        widgets.active.weak_bg_fill = p.interactive_active;
+        widgets.active.bg_fill = p.interactive_active;
+        widgets.active.bg_stroke = Stroke::NONE;
+        widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+        ui.add(egui::Button::new(label))
+    })
+    .inner
+}
+
+/// Carbon danger button for destructive actions (interrupt).
+pub(crate) fn danger_button(ui: &mut Ui, label: impl Into<egui::WidgetText>) -> Response {
+    let p = CarbonPalette::of(ui);
+    ui.scope(|ui| {
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.weak_bg_fill = p.danger_bg;
+        widgets.inactive.bg_fill = p.danger_bg;
+        widgets.inactive.bg_stroke = Stroke::new(1.0_f32, p.danger);
+        widgets.inactive.fg_stroke = Stroke::new(1.0_f32, p.danger);
+        widgets.hovered.weak_bg_fill = p.danger;
+        widgets.hovered.bg_fill = p.danger;
+        widgets.hovered.bg_stroke = Stroke::new(1.0_f32, p.danger);
+        widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+        widgets.active.weak_bg_fill = p.danger;
+        widgets.active.bg_fill = p.danger;
+        widgets.active.bg_stroke = Stroke::new(1.0_f32, p.danger);
+        widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+        ui.add(egui::Button::new(label))
+    })
+    .inner
+}
+
+/// Consume a single-press binding (e.g. "shift+enter") from this frame's
+/// input.  Returns true if the binding fired.
+pub(crate) fn consume_binding(ui: &mut Ui, binding: &str) -> bool {
+    let Some(presses) = crate::settings::parse_binding(binding) else {
+        return false;
+    };
+    let Some(press) = presses.first() else {
+        return false;
+    };
+    ui.input_mut(|input| input.consume_key(press.modifiers, press.key))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiAction {
@@ -42,8 +106,28 @@ pub enum UiAction {
     MoveUp(CellId),
     MoveDown(CellId),
     Run(CellId),
+    RunAndAdvance(CellId),
+    RunAndInsertBelow(CellId),
+    /// Tab was pressed in a cell editor: ask the driver for completions for
+    /// the token ending at `offset` (in characters) and starting at `start`.
+    RequestCompletion {
+        cell: CellId,
+        source: String,
+        offset: usize,
+        start: usize,
+    },
+    /// Ctrl+Space (or the configured binding): ask the driver for the docstring
+    /// of the name ending at `offset`.
+    RequestDocs {
+        cell: CellId,
+        source: String,
+        offset: usize,
+    },
     RunAll,
     RunAbove(CellId),
+    ShowSettings,
+    ShowShortcuts,
+    ToCommandMode(CellId),
     Interrupt,
     RestartSage,
     ToggleInspector,
@@ -78,7 +162,6 @@ pub struct InspectorState<'a> {
     pub vars: &'a [VarInfo],
     pub loading: bool,
     pub error: Option<&'a str>,
-    pub last_updated: Option<Instant>,
     pub backend_ready: bool,
     pub starting: bool,
     pub blocked_running: bool,
@@ -98,30 +181,51 @@ pub struct NotebookUi<'a> {
     pub syntax: &'a SyntaxAssets,
     pub renderer: &'a mut Renderer,
     pub actions: &'a mut Vec<UiAction>,
+    pub bindings: &'a crate::settings::Keybindings,
+    /// Jupyter-style selection highlight (command mode).
+    pub selected: Option<CellId>,
+    /// Cell to scroll into view this frame.
+    pub scroll_to_cell: &'a mut Option<CellId>,
 }
 
-/// Syntax definitions and theme loaded once at startup.  The fallback editor
-/// uses these for every cell.
+/// Syntax definitions and themes loaded once at startup.  The fallback editor
+/// uses these for every cell.  Both a light (InspiredGitHub) and a dark
+/// (base16-ocean.dark) theme are kept so switching the UI theme recolours the
+/// code instead of leaving dark text on a dark canvas.
 pub struct SyntaxAssets {
     syntaxes: SyntaxSet,
-    theme: Theme,
+    light_theme: Theme,
+    dark_theme: Theme,
+    /// Memoised shaped text so resize/repaint does not re-run syntect
+    /// highlighting every frame.  Keyed by source text, wrap width, font and
+    /// theme.
+    galley_cache: RefCell<HashMap<u64, Arc<egui::Galley>>>,
 }
 
 impl SyntaxAssets {
     pub fn new() -> Self {
         let syntaxes = SyntaxSet::load_defaults_newlines();
         let themes = ThemeSet::load_defaults();
-        // Prefer a light theme to match the light UI, then any theme, then
-        // syntect's Default-derived empty theme.  A missing theme here must
-        // degrade to unhighlighted text, never panic the app at startup.
-        let theme = themes
+        let light_theme = themes
             .themes
             .get("InspiredGitHub")
             .or_else(|| themes.themes.get("base16-ocean.light"))
             .or_else(|| themes.themes.values().next())
             .cloned()
             .unwrap_or_default();
-        Self { syntaxes, theme }
+        let dark_theme = themes
+            .themes
+            .get("base16-ocean.dark")
+            .or_else(|| themes.themes.get("Solarized (dark)"))
+            .or_else(|| themes.themes.get("Monokai"))
+            .cloned()
+            .unwrap_or_else(|| light_theme.clone());
+        Self {
+            syntaxes,
+            light_theme,
+            dark_theme,
+            galley_cache: RefCell::new(HashMap::new()),
+        }
     }
 
     fn layout(&self, text: &str, ui: &Ui, wrap_width: f32) -> egui::text::LayoutJob {
@@ -136,10 +240,16 @@ impl SyntaxAssets {
             .get(&TextStyle::Monospace)
             .cloned()
             .unwrap_or_else(|| FontId::monospace(13.5));
+        let p = CarbonPalette::of(ui);
         let fallback_format = egui::text::TextFormat {
             font_id: font.clone(),
-            color: Color32::from_rgb(35, 35, 35),
+            color: p.text_primary,
             ..Default::default()
+        };
+        let theme = if p.dark_mode {
+            &self.dark_theme
+        } else {
+            &self.light_theme
         };
 
         let mut job = egui::text::LayoutJob::default();
@@ -149,7 +259,7 @@ impl SyntaxAssets {
             f32::INFINITY
         };
 
-        let mut highlighter = HighlightLines::new(syntax, &self.theme);
+        let mut highlighter = HighlightLines::new(syntax, theme);
         for line in LinesWithEndings::from(text) {
             match highlighter.highlight_line(line, &self.syntaxes) {
                 Ok(ranges) => {
@@ -179,26 +289,78 @@ impl SyntaxAssets {
         }
         job
     }
+
+    /// Shape `text` with syntax highlighting, memoised on
+    /// `(text, wrap_width, font)` so a repaint or resize only pays for the
+    /// cells whose wrap width actually changed.
+    pub fn layout_galley(&self, ui: &Ui, text: &str, wrap_width: f32) -> Arc<egui::Galley> {
+        let font = ui
+            .style()
+            .text_styles
+            .get(&TextStyle::Monospace)
+            .cloned()
+            .unwrap_or_else(|| FontId::monospace(13.5));
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        text.hash(&mut hasher);
+        hasher.write_u32(wrap_width.to_bits());
+        hasher.write_u32(font.size.to_bits());
+        font.family.hash(&mut hasher);
+        hasher.write_u8(u8::from(ui.visuals().dark_mode));
+        let key = hasher.finish();
+
+        if let Some(galley) = self.galley_cache.borrow().get(&key) {
+            return galley.clone();
+        }
+        let job = self.layout(text, ui, wrap_width);
+        let galley: Arc<egui::Galley> = ui.fonts(|fonts| fonts.layout_job(job));
+        let mut cache = self.galley_cache.borrow_mut();
+        if cache.len() >= 128 {
+            cache.clear();
+        }
+        cache.insert(key, galley.clone());
+        galley
+    }
 }
 
 /// Menus and quick actions.  All actions are returned to the app, which is the
 /// only writer of notebook/backend state.
 pub fn menu_bar(ctx: &egui::Context, state: &MenuState) -> Vec<UiAction> {
     let mut actions = Vec::new();
+    let p = if ctx.theme() == egui::Theme::Dark {
+        CarbonPalette::dark()
+    } else {
+        CarbonPalette::light()
+    };
     egui::TopBottomPanel::top("sagenote-menubar")
         .frame(
             egui::Frame::default()
-                .fill(Color32::from_gray(248))
-                .stroke(Stroke::new(1.0_f32, Color32::from_gray(228)))
-                .inner_margin(egui::Margin::symmetric(8, 4)),
+                .fill(p.bg)
+                .stroke(Stroke::new(1.0_f32, p.border_subtle))
+                .inner_margin(egui::Margin::symmetric(12, 4)),
         )
         .show(ctx, |ui| {
+            // Carbon navigation is text-first: no boxes around menu labels.
+            // Hover still paints a Gray 10 row so the menus remain discoverable.
+            {
+                let widgets = &mut ui.visuals_mut().widgets;
+                widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+                widgets.inactive.bg_stroke = Stroke::NONE;
+                widgets.hovered.bg_stroke = Stroke::NONE;
+                widgets.active.bg_stroke = Stroke::NONE;
+            }
             egui::menu::bar(ui, |ui| {
+                ui.label(
+                    RichText::new("sagenote")
+                        .font(semibold(15.0))
+                        .color(p.text_primary),
+                );
+                ui.add_space(4.0);
                 ui.menu_button("File", |ui| {
                     menu_item(
                         ui,
                         "New",
-                        Some("Ctrl/⌘ N"),
+                        Some("Ctrl/Cmd N"),
                         true,
                         UiAction::New,
                         &mut actions,
@@ -206,7 +368,7 @@ pub fn menu_bar(ctx: &egui::Context, state: &MenuState) -> Vec<UiAction> {
                     menu_item(
                         ui,
                         "Open…",
-                        Some("Ctrl/⌘ O"),
+                        Some("Ctrl/Cmd O"),
                         true,
                         UiAction::Open,
                         &mut actions,
@@ -214,7 +376,7 @@ pub fn menu_bar(ctx: &egui::Context, state: &MenuState) -> Vec<UiAction> {
                     menu_item(
                         ui,
                         "Save",
-                        Some("Ctrl/⌘ S"),
+                        Some("Ctrl/Cmd S"),
                         true,
                         UiAction::Save,
                         &mut actions,
@@ -222,7 +384,7 @@ pub fn menu_bar(ctx: &egui::Context, state: &MenuState) -> Vec<UiAction> {
                     menu_item(
                         ui,
                         "Save As…",
-                        Some("Ctrl/⌘ Shift S"),
+                        Some("Ctrl/Cmd Shift S"),
                         true,
                         UiAction::SaveAs,
                         &mut actions,
@@ -231,7 +393,7 @@ pub fn menu_bar(ctx: &egui::Context, state: &MenuState) -> Vec<UiAction> {
                     menu_item(
                         ui,
                         "Quit",
-                        Some("Ctrl/⌘ Q"),
+                        Some("Ctrl/Cmd Q"),
                         true,
                         UiAction::Quit,
                         &mut actions,
@@ -261,7 +423,7 @@ pub fn menu_bar(ctx: &egui::Context, state: &MenuState) -> Vec<UiAction> {
                     menu_item(
                         ui,
                         "Interrupt",
-                        Some("Ctrl/⌘ ."),
+                        Some("Ctrl/Cmd ."),
                         state.running,
                         UiAction::Interrupt,
                         &mut actions,
@@ -285,7 +447,7 @@ pub fn menu_bar(ctx: &egui::Context, state: &MenuState) -> Vec<UiAction> {
                     menu_item(
                         ui,
                         label,
-                        Some("Ctrl/⌘ I"),
+                        Some("Ctrl/Cmd I"),
                         true,
                         UiAction::ToggleInspector,
                         &mut actions,
@@ -302,10 +464,28 @@ pub fn menu_bar(ctx: &egui::Context, state: &MenuState) -> Vec<UiAction> {
                 ui.menu_button("Help", |ui| {
                     menu_item(
                         ui,
+                        "Keyboard Shortcuts…",
+                        None,
+                        true,
+                        UiAction::ShowShortcuts,
+                        &mut actions,
+                    );
+                    menu_item(
+                        ui,
                         "About sagenote",
                         None,
                         true,
                         UiAction::ShowAbout,
+                        &mut actions,
+                    );
+                });
+                ui.menu_button("Settings", |ui| {
+                    menu_item(
+                        ui,
+                        "Settings…",
+                        Some("Ctrl/Cmd ,"),
+                        true,
+                        UiAction::ShowSettings,
                         &mut actions,
                     );
                 });
@@ -315,20 +495,22 @@ pub fn menu_bar(ctx: &egui::Context, state: &MenuState) -> Vec<UiAction> {
                     ui.spinner();
                     ui.label(RichText::new("Starting Sage…").small().weak());
                 } else {
-                    if ui
-                        .add_enabled(state.backend_ready, egui::Button::new("▶ Run All").small())
-                        .on_hover_text("Evaluate every non-empty cell")
-                        .clicked()
-                    {
-                        actions.push(UiAction::RunAll);
-                    }
-                    if ui
-                        .add_enabled(state.running, egui::Button::new("■ Interrupt").small())
-                        .on_hover_text("SIGINT the Sage process group")
-                        .clicked()
-                    {
-                        actions.push(UiAction::Interrupt);
-                    }
+                    ui.add_enabled_ui(state.backend_ready, |ui| {
+                        if primary_button(ui, "Run All")
+                            .on_hover_text("Evaluate every non-empty cell")
+                            .clicked()
+                        {
+                            actions.push(UiAction::RunAll);
+                        }
+                    });
+                    ui.add_enabled_ui(state.running, |ui| {
+                        if danger_button(ui, "Interrupt")
+                            .on_hover_text("SIGINT the Sage process group")
+                            .clicked()
+                        {
+                            actions.push(UiAction::Interrupt);
+                        }
+                    });
                 }
             });
         });
@@ -354,12 +536,17 @@ fn menu_item(
 }
 
 pub fn status_bar(ctx: &egui::Context, state: &StatusState) {
+    let p = if ctx.theme() == egui::Theme::Dark {
+        CarbonPalette::dark()
+    } else {
+        CarbonPalette::light()
+    };
     egui::TopBottomPanel::bottom("sagenote-status")
         .frame(
             egui::Frame::default()
-                .fill(Color32::from_gray(248))
-                .stroke(Stroke::new(1.0_f32, Color32::from_gray(228)))
-                .inner_margin(egui::Margin::symmetric(10, 3)),
+                .fill(p.layer)
+                .stroke(Stroke::new(1.0_f32, p.border_subtle))
+                .inner_margin(egui::Margin::symmetric(12, 4)),
         )
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -370,7 +557,8 @@ pub fn status_bar(ctx: &egui::Context, state: &StatusState) {
                     ui.label(
                         RichText::new(format!("Sage {}", state.sage_version))
                             .small()
-                            .strong(),
+                            .strong()
+                            .color(p.text_primary),
                     );
                     if let Some(path) = &state.sage_path {
                         let text = display_path(path, 48);
@@ -379,16 +567,12 @@ pub fn status_bar(ctx: &egui::Context, state: &StatusState) {
                             .on_hover_text(path.display().to_string());
                     }
                 } else {
-                    ui.label(RichText::new("Sage unavailable").small().color(ERROR_RED));
+                    ui.label(RichText::new("Sage unavailable").small().color(p.danger));
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if state.dirty {
-                        ui.label(
-                            RichText::new("● unsaved")
-                                .small()
-                                .color(egui::Color32::from_rgb(180, 110, 20)),
-                        );
+                        ui.label(RichText::new("• unsaved").small().color(p.warning));
                     } else if state.notebook_path.is_none() {
                         ui.label(RichText::new("not saved").small().weak());
                     } else {
@@ -402,7 +586,7 @@ pub fn status_bar(ctx: &egui::Context, state: &StatusState) {
                     );
                     ui.separator();
                     if let Some(running) = &state.running {
-                        ui.label(RichText::new(running).small().color(RUNNING_BLUE));
+                        ui.label(RichText::new(running).small().color(p.interactive));
                         ui.separator();
                     }
                     let title = state
@@ -425,6 +609,11 @@ pub fn status_bar(ctx: &egui::Context, state: &StatusState) {
 
 pub fn inspector_panel(ctx: &egui::Context, state: &InspectorState<'_>) -> Option<InspectorAction> {
     let mut action = None;
+    let p = if ctx.theme() == egui::Theme::Dark {
+        CarbonPalette::dark()
+    } else {
+        CarbonPalette::light()
+    };
     let can_refresh =
         state.backend_ready && !state.starting && !state.loading && !state.blocked_running;
     let disabled_reason = if state.starting {
@@ -440,9 +629,9 @@ pub fn inspector_panel(ctx: &egui::Context, state: &InspectorState<'_>) -> Optio
     };
 
     let frame = egui::Frame::default()
-        .fill(Color32::from_gray(249))
-        .stroke(Stroke::new(1.0_f32, Color32::from_gray(226)))
-        .inner_margin(egui::Margin::same(10));
+        .fill(p.layer)
+        .stroke(Stroke::new(1.0_f32, p.border_subtle))
+        .inner_margin(egui::Margin::same(12));
     egui::SidePanel::right("sagenote-inspector")
         .resizable(true)
         .default_width(276.0)
@@ -450,10 +639,14 @@ pub fn inspector_panel(ctx: &egui::Context, state: &InspectorState<'_>) -> Optio
         .frame(frame)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Variables").strong().size(15.0));
+                ui.label(
+                    RichText::new("Variables")
+                        .font(semibold(15.0))
+                        .color(p.text_primary),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .small_button("✕")
+                        .small_button("×")
                         .on_hover_text("Close inspector")
                         .clicked()
                     {
@@ -471,59 +664,43 @@ pub fn inspector_panel(ctx: &egui::Context, state: &InspectorState<'_>) -> Optio
                 });
             });
 
-            ui.add_space(2.0);
-            ui.horizontal_wrapped(|ui| {
+            if state.vars.is_empty() {
+                // Only states the user needs to act on are shown.  There is no
+                // permanent "N variables · updated HH:MM:SS" status line: the
+                // list itself is the answer, and the timestamp only made the
+                // panel flicker on every auto-refresh.
+                ui.add_space(8.0);
                 if state.starting {
-                    ui.spinner();
-                    ui.label(RichText::new("Starting Sage…").small().weak());
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Starting Sage…").small().weak());
+                    });
                 } else if state.loading {
-                    ui.spinner();
-                    ui.label(RichText::new("Reading globals…").small().weak());
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Reading variables…").small().weak());
+                    });
+                } else if let Some(error) = state.error {
+                    ui.add(egui::Label::new(RichText::new(error).small().color(p.danger)).wrap());
+                } else if !state.backend_ready {
+                    ui.label(RichText::new("Sage is not running").small().weak());
                 } else if state.blocked_running {
                     ui.label(
                         RichText::new("Paused while a cell runs")
                             .small()
-                            .color(STDERR_ORANGE),
-                    );
-                } else if let Some(error) = state.error {
-                    ui.label(RichText::new(error).small().color(ERROR_RED));
-                } else if !state.backend_ready {
-                    ui.label(RichText::new("Sage is not running").small().weak());
-                } else if let Some(updated) = state.last_updated {
-                    let noun = if state.vars.len() == 1 {
-                        "variable"
-                    } else {
-                        "variables"
-                    };
-                    ui.label(
-                        RichText::new(format!(
-                            "{} {noun} · updated {} · auto 2 s",
-                            state.vars.len(),
-                            format_age(updated.elapsed())
-                        ))
-                        .small()
-                        .weak(),
+                            .color(p.warning),
                     );
                 } else {
-                    ui.label(RichText::new("Not read yet").small().weak());
-                }
-            });
-            ui.separator();
-
-            if state.vars.is_empty() {
-                if state.backend_ready
-                    && !state.blocked_running
-                    && !state.loading
-                    && state.error.is_none()
-                    && state.last_updated.is_some()
-                {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("No user variables yet.").strong());
-                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new("No user variables yet.")
+                            .small()
+                            .strong()
+                            .color(p.text_primary),
+                    );
                     ui.add(
                         egui::Label::new(
                             RichText::new(
-                                "Assign a name in a cell, then refresh. The driver hides Sage's own globals.",
+                                "Assign a name in a cell; the driver hides Sage's own globals.",
                             )
                             .small()
                             .weak(),
@@ -534,44 +711,101 @@ pub fn inspector_panel(ctx: &egui::Context, state: &InspectorState<'_>) -> Optio
                 return;
             }
 
+            ui.add_space(4.0);
             egui::ScrollArea::vertical()
                 .id_salt("sagenote-inspector-vars")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for var in state.vars {
                         ui.push_id(var.name.as_str(), |ui| {
+                            // One compact block per variable: name + type on
+                            // one line, repr below.  No per-entry box and no
+                            // separator; spacing alone keeps the list readable.
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
                                     RichText::new(&var.name)
                                         .monospace()
                                         .strong()
-                                        .size(13.0),
+                                        .color(p.text_primary),
                                 );
-                                ui.label(RichText::new(&var.type_name).small().weak());
+                                ui.label(
+                                    RichText::new(&var.type_name).small().color(p.text_helper),
+                                );
                             });
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(&var.value).monospace().small(),
+                                    RichText::new(&var.value)
+                                        .monospace()
+                                        .small()
+                                        .color(p.text_secondary),
                                 )
                                 .wrap(),
                             );
                         });
-                        ui.add_space(2.0);
-                        ui.separator();
+                        ui.add_space(10.0);
                     }
                 });
         });
     action
 }
 
-fn format_age(elapsed: Duration) -> String {
-    if elapsed.as_secs() < 1 {
-        "just now".to_owned()
-    } else if elapsed.as_secs() < 60 {
-        format!("{}s ago", elapsed.as_secs())
+/// State for the toolbar row.
+pub struct ToolbarState {
+    pub backend_ready: bool,
+    pub running: bool,
+}
+
+/// A JupyterLab-style toolbar row: quick actions with tooltips.
+/// Returns actions for the app to dispatch.
+pub fn toolbar(ctx: &egui::Context, state: &ToolbarState) -> Vec<UiAction> {
+    let mut actions = Vec::new();
+    let p = if ctx.theme() == egui::Theme::Dark {
+        CarbonPalette::dark()
     } else {
-        format!("{}m ago", elapsed.as_secs() / 60)
-    }
+        CarbonPalette::light()
+    };
+    egui::TopBottomPanel::top("sagenote-toolbar")
+        .frame(
+            egui::Frame::default()
+                .fill(p.layer)
+                .stroke(Stroke::new(1.0_f32, p.border_subtle))
+                .inner_margin(egui::Margin::symmetric(12, 6)),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .button("+ Cell")
+                    .on_hover_text("Insert a cell below (B)")
+                    .clicked()
+                {
+                    actions.push(UiAction::AddCell(None));
+                }
+                ui.add_enabled_ui(state.backend_ready, |ui| {
+                    if primary_button(ui, "Run All")
+                        .on_hover_text("Evaluate every non-empty cell")
+                        .clicked()
+                    {
+                        actions.push(UiAction::RunAll);
+                    }
+                });
+                ui.add_enabled_ui(state.running, |ui| {
+                    if danger_button(ui, "Interrupt")
+                        .on_hover_text("SIGINT the Sage process group")
+                        .clicked()
+                    {
+                        actions.push(UiAction::Interrupt);
+                    }
+                });
+                if ui
+                    .button("↻ Restart Sage")
+                    .on_hover_text("Restart the Sage process")
+                    .clicked()
+                {
+                    actions.push(UiAction::RestartSage);
+                }
+            });
+        });
+    actions
 }
 
 /// Draw the cells.  Returns true if any source text changed.
@@ -584,6 +818,9 @@ pub fn notebook_ui(ui: &mut Ui, notebook: &mut Notebook, state: NotebookUi<'_>) 
         syntax,
         renderer,
         actions,
+        bindings,
+        selected,
+        scroll_to_cell,
     } = state;
 
     if notebook.cells.is_empty() {
@@ -607,11 +844,12 @@ pub fn notebook_ui(ui: &mut Ui, notebook: &mut Notebook, state: NotebookUi<'_>) 
             focus_request,
             last_focused,
             actions,
+            bindings,
+            selected,
+            scroll_to_cell,
         );
         if index + 1 < total {
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(6.0);
+            ui.add_space(10.0);
         }
     }
     changed
@@ -630,37 +868,126 @@ fn draw_cell(
     focus_request: &mut Option<CellId>,
     last_focused: &mut Option<CellId>,
     actions: &mut Vec<UiAction>,
+    bindings: &crate::settings::Keybindings,
+    selected: Option<CellId>,
+    scroll_to_cell: &mut Option<CellId>,
 ) -> bool {
     ui.push_id(cell.id, |ui| {
         let editor_id = egui::Id::new(("sagenote-cell-editor", cell.id.0));
+        let p = CarbonPalette::of(ui);
         // Consume Shift+Enter before TextEdit sees it.  Only when this editor is
         // focused, so Enter elsewhere keeps its normal meaning.
         let focused = ui.memory(|memory| memory.has_focus(editor_id));
         let shift_enter =
             focused && ui.input_mut(|input| input.consume_key(Modifiers::SHIFT, Key::Enter));
 
-        let border = if rt.state == CellState::Running {
-            RUNNING_BLUE.gamma_multiply(0.55)
+        // Completion popup keys are consumed before the editor or the run
+        // bindings, so arrows/Enter/Tab/Esc navigate the popup instead of
+        // moving the caret or running the cell.
+        if focused && rt.completion_popup.is_some() {
+            handle_completion_keys(ui, rt, bindings);
+        }
+
+        // Jupyter binding consumption: only when this editor is focused so
+        // Enter elsewhere keeps its normal meaning.
+        if focused {
+            if consume_binding(ui, bindings.get("run_and_advance")) {
+                rt.completion_popup = None;
+                actions.push(UiAction::RunAndAdvance(cell.id));
+            } else if consume_binding(ui, bindings.get("run")) {
+                rt.completion_popup = None;
+                actions.push(UiAction::Run(cell.id));
+            } else if consume_binding(ui, bindings.get("run_and_insert_below")) {
+                rt.completion_popup = None;
+                actions.push(UiAction::RunAndInsertBelow(cell.id));
+            } else if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+                // Escape leaves edit mode and enters command mode (Jupyter).
+                actions.push(UiAction::ToCommandMode(cell.id));
+            }
+        }
+
+        // Tab completion: only in edit mode, only when no request is already
+        // in flight, and only when the popup is not open (the popup consumed
+        // Tab as "accept" above).
+        if focused
+            && rt.completion_popup.is_none()
+            && rt.completion_request.is_none()
+            && consume_binding(ui, bindings.get("complete"))
+        {
+            let cursor = egui::widgets::text_edit::TextEditState::load(ui.ctx(), editor_id)
+                .and_then(|state| state.cursor.char_range())
+                .filter(|range| range.primary.index == range.secondary.index)
+                .map(|range| range.primary.index)
+                .unwrap_or_else(|| cell.source.chars().count());
+            let start = completion_token_start(&cell.source, cursor);
+            if start < cursor {
+                actions.push(UiAction::RequestCompletion {
+                    cell: cell.id,
+                    source: cell.source.clone(),
+                    offset: cursor,
+                    start,
+                });
+            }
+        }
+
+        // Documentation: Ctrl+Space by default.  It shares the editor-focus
+        // gate with completion and closes an open candidate list first.
+        if focused && rt.doc_request.is_none() && consume_binding(ui, bindings.get("show_docs")) {
+            let cursor = egui::widgets::text_edit::TextEditState::load(ui.ctx(), editor_id)
+                .and_then(|state| state.cursor.char_range())
+                .filter(|range| range.primary.index == range.secondary.index)
+                .map(|range| range.primary.index)
+                .unwrap_or_else(|| cell.source.chars().count());
+            rt.completion_popup = None;
+            actions.push(UiAction::RequestDocs {
+                cell: cell.id,
+                source: cell.source.clone(),
+                offset: cursor,
+            });
+        }
+
+        // Scroll this cell into view when requested (Jupyter `G`/`gg`).
+        if scroll_to_cell.is_some_and(|target| target == cell.id) {
+            ui.scroll_to_rect(ui.available_rect_before_wrap(), None);
+            *scroll_to_cell = None;
+        }
+
+        // A completion chosen on a previous frame (single candidate, or a
+        // click/Enter in the popup) is applied before the editor is laid out.
+        let mut cursor_after: Option<usize> = None;
+        let mut source_changed = false;
+        if let Some((start, end, insert)) = rt.pending_completion.take() {
+            let (new_source, new_cursor) = apply_completion(&cell.source, start, end, &insert);
+            if new_source != cell.source {
+                cell.source = new_source;
+                cursor_after = Some(new_cursor);
+                source_changed = true;
+            }
+        }
+
+        let is_selected = selected == Some(cell.id);
+        let border = if is_selected || rt.state == CellState::Running {
+            p.interactive
         } else {
-            CELL_BORDER
+            p.border_subtle
         };
         let frame = egui::Frame::default()
-            .fill(Color32::WHITE)
+            .fill(p.bg)
             .stroke(Stroke::new(1.0_f32, border))
-            .corner_radius(8.0)
-            .inner_margin(12.0);
+            .corner_radius(0.0)
+            .inner_margin(16.0);
         frame
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(format!("Cell {}", index + 1))
-                            .strong()
-                            .size(14.0),
+                            .font(semibold(14.0))
+                            .color(p.text_primary),
                     );
                     ui.add_space(4.0);
                     state_badge(ui, rt);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("✕").on_hover_text("Delete cell").clicked() {
+                        if ui.small_button("×").on_hover_text("Delete cell").clicked() {
                             actions.push(UiAction::DeleteCell(cell.id));
                         }
                         if ui
@@ -678,45 +1005,44 @@ fn draw_cell(
                             actions.push(UiAction::MoveUp(cell.id));
                         }
                         if ui
-                            .small_button("＋")
+                            .small_button("+")
                             .on_hover_text("Insert a cell below")
                             .clicked()
                         {
                             actions.push(UiAction::AddCell(Some(cell.id)));
                         }
-                        if ui
-                            .add_enabled(backend_ready, egui::Button::new("Run").small())
-                            .on_hover_text("Evaluate this cell (Shift+Enter)")
-                            .clicked()
-                        {
-                            actions.push(UiAction::Run(cell.id));
-                        }
+                        ui.add_enabled_ui(backend_ready, |ui| {
+                            if primary_button(ui, "Run")
+                                .on_hover_text("Evaluate this cell (Shift+Enter)")
+                                .clicked()
+                            {
+                                actions.push(UiAction::Run(cell.id));
+                            }
+                        });
                     });
                 });
 
-                ui.add_space(4.0);
+                ui.add_space(6.0);
                 let width = ui.available_width();
                 let mut layouter = |ui: &Ui, text: &str, wrap_width: f32| {
-                    let job = syntax.layout(text, ui, wrap_width);
-                    ui.fonts(|fonts| fonts.layout_job(job))
+                    syntax.layout_galley(ui, text, wrap_width)
                 };
-                let response = ui.add(
-                    egui::TextEdit::multiline(&mut cell.source)
-                        .id(editor_id)
-                        .code_editor()
-                        .desired_rows(4)
-                        .desired_width(width)
-                        .background_color(Color32::from_gray(252))
-                        .layouter(&mut layouter),
-                );
+                let mut output = egui::TextEdit::multiline(&mut cell.source)
+                    .id(editor_id)
+                    .code_editor()
+                    .desired_rows(4)
+                    .desired_width(width)
+                    .background_color(p.field)
+                    .layouter(&mut layouter)
+                    .show(ui);
                 if *focus_request == Some(cell.id) {
-                    response.request_focus();
+                    output.response.request_focus();
                     *focus_request = None;
                 }
-                if response.has_focus() {
+                if output.response.has_focus() {
                     *last_focused = Some(cell.id);
                 }
-                let changed = response.changed();
+                let changed = output.response.changed() || source_changed;
                 if changed {
                     // The displayed value no longer corresponds to the source,
                     // and any in-flight run is superseded for routing purposes.
@@ -726,9 +1052,26 @@ fn draw_cell(
                     rt.started = None;
                     rt.elapsed = None;
                     cell.state = CellState::Idle;
+                    rt.completion_popup = None;
+                    rt.completion_request = None;
+                    rt.doc_request = None;
                 }
                 if shift_enter {
+                    rt.completion_popup = None;
                     actions.push(UiAction::Run(cell.id));
+                }
+
+                if let Some(index) = cursor_after {
+                    output
+                        .state
+                        .cursor
+                        .set_char_range(Some(CCursorRange::one(CCursor::new(index))));
+                    output.state.store(ui.ctx(), editor_id);
+                    output.response.request_focus();
+                } else if rt.completion_popup.is_some() && output.response.has_focus() {
+                    draw_completion_popup(ui, cell.id, rt, &output, focus_request);
+                } else if !output.response.has_focus() {
+                    rt.completion_popup = None;
                 }
 
                 if rt.has_output()
@@ -738,7 +1081,7 @@ fn draw_cell(
                         CellState::Running | CellState::Queued | CellState::Interrupted
                     )
                 {
-                    ui.add_space(6.0);
+                    ui.add_space(8.0);
                     draw_outputs(ui, rt, renderer);
                 }
                 changed
@@ -748,14 +1091,136 @@ fn draw_cell(
     .inner
 }
 
+/// Consume keys the completion popup owns.  Returns true when a key was
+/// consumed.  `Up`/`Down` move the selection, `Enter`/`Tab` accept, `Esc`
+/// closes.  Accepting stages the replacement for the next frame, because the
+/// caret can only be moved after the `TextEdit` has run.
+fn handle_completion_keys(
+    ui: &mut Ui,
+    rt: &mut CellRuntime,
+    bindings: &crate::settings::Keybindings,
+) -> bool {
+    let Some(popup) = rt.completion_popup.as_mut() else {
+        return false;
+    };
+    let mut consumed = false;
+    if consume_binding(ui, bindings.get("completion_next"))
+        || ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowDown))
+    {
+        popup.selected = (popup.selected + 1) % popup.items.len();
+        consumed = true;
+    }
+    if consume_binding(ui, bindings.get("completion_prev"))
+        || ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowUp))
+    {
+        popup.selected = (popup.selected + popup.items.len() - 1) % popup.items.len();
+        consumed = true;
+    }
+    let accept = ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter))
+        || consume_binding(ui, bindings.get("complete"));
+    let cancel = ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
+    if accept {
+        let item = popup.items[popup.selected].clone();
+        rt.pending_completion = Some((popup.start, popup.end, item));
+        rt.completion_popup = None;
+        consumed = true;
+    } else if cancel {
+        rt.completion_popup = None;
+        consumed = true;
+    }
+    consumed
+}
+
+/// Render the completion list just below the caret.  The list is a Carbon
+/// popup: white (or Gray 90) surface, hairline border, square corners.
+fn draw_completion_popup(
+    ui: &mut Ui,
+    cell: CellId,
+    rt: &mut CellRuntime,
+    output: &egui::widgets::text_edit::TextEditOutput,
+    focus_request: &mut Option<CellId>,
+) {
+    let Some(mut popup) = rt.completion_popup.take() else {
+        return;
+    };
+    let p = CarbonPalette::of(ui);
+    let cursor = output
+        .state
+        .cursor
+        .char_range()
+        .map(|range| range.sorted()[1].index)
+        .unwrap_or(0);
+    let caret = output.galley.pos_from_ccursor(CCursor::new(cursor));
+    let anchor = output.galley_pos + caret.left_bottom().to_vec2() + egui::vec2(0.0, 4.0);
+
+    let mut chosen: Option<String> = None;
+    egui::Area::new(egui::Id::new(("sagenote-completion", cell.0)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor)
+        .constrain(true)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::default()
+                .fill(p.bg)
+                .stroke(Stroke::new(1.0_f32, p.border_strong))
+                .corner_radius(0.0)
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 4],
+                    blur: 12,
+                    spread: 0,
+                    color: Color32::from_black_alpha(if p.dark_mode { 120 } else { 36 }),
+                })
+                .inner_margin(2.0)
+                .show(ui, |ui| {
+                    // Compact, IDE-like rows: 22 px tall, tight padding,
+                    // 13 px mono.  The global 32 px control height is too
+                    // airy for a completion list.
+                    ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
+                    ui.spacing_mut().interact_size = egui::vec2(0.0, 22.0);
+                    ui.set_min_width(180.0);
+                    ui.set_max_width(320.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt(("sagenote-completion-scroll", cell.0))
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            for (index, item) in popup.items.iter().enumerate() {
+                                let selected = index == popup.selected;
+                                let text = RichText::new(item)
+                                    .monospace()
+                                    .size(13.0)
+                                    .color(p.text_primary);
+                                let response = ui.add_sized(
+                                    [ui.available_width(), 22.0],
+                                    egui::SelectableLabel::new(selected, text),
+                                );
+                                if selected {
+                                    response.scroll_to_me(Some(egui::Align::Center));
+                                }
+                                if response.clicked() {
+                                    chosen = Some(item.clone());
+                                }
+                            }
+                        });
+                });
+        });
+
+    if let Some(item) = chosen {
+        rt.pending_completion = Some((popup.start, popup.end, item));
+        *focus_request = Some(cell);
+    } else {
+        popup.selected = popup.selected.min(popup.items.len().saturating_sub(1));
+        rt.completion_popup = Some(popup);
+    }
+}
+
 fn state_badge(ui: &mut Ui, rt: &CellRuntime) {
-    let (label, color) = match rt.state {
-        CellState::Idle => ("idle", Color32::from_gray(120)),
-        CellState::Queued => ("queued", Color32::from_rgb(60, 105, 160)),
-        CellState::Running => ("running", RUNNING_BLUE),
-        CellState::Ok => ("ok", Color32::from_rgb(45, 125, 65)),
-        CellState::Error => ("error", ERROR_RED),
-        CellState::Interrupted => ("interrupted", STDERR_ORANGE),
+    let p = CarbonPalette::of(ui);
+    let (label, bg, fg) = match rt.state {
+        CellState::Idle => ("idle", p.layer, p.text_helper),
+        CellState::Queued => ("queued", p.layer, p.interactive),
+        CellState::Running => ("running", p.selected, p.interactive),
+        CellState::Ok => ("ok", p.success_bg, p.success),
+        CellState::Error => ("error", p.danger_bg, p.danger),
+        CellState::Interrupted => ("interrupted", p.warning_bg, p.warning),
     };
     let elapsed = if rt.state == CellState::Running {
         rt.started.map(|started| started.elapsed())
@@ -767,20 +1232,21 @@ fn state_badge(ui: &mut Ui, rt: &CellRuntime) {
         None => label.to_owned(),
     };
     egui::Frame::default()
-        .fill(color.gamma_multiply(0.12))
-        .corner_radius(8.0)
-        .inner_margin(egui::Margin::symmetric(6, 2))
+        .fill(bg)
+        .corner_radius(2.0)
+        .inner_margin(egui::Margin::symmetric(8, 2))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).small().color(color));
+            ui.label(RichText::new(text).small().color(fg));
         });
 }
 
 fn draw_outputs(ui: &mut Ui, rt: &CellRuntime, renderer: &mut Renderer) {
+    let p = CarbonPalette::of(ui);
     egui::Frame::default()
-        .fill(OUTPUT_BG)
-        .stroke(Stroke::new(1.0_f32, Color32::from_gray(228)))
-        .corner_radius(6.0)
-        .inner_margin(9.0)
+        .fill(p.output_bg)
+        .stroke(Stroke::new(1.0_f32, p.border_subtle))
+        .corner_radius(0.0)
+        .inner_margin(12.0)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             if rt.state == CellState::Queued {
@@ -814,9 +1280,9 @@ fn draw_outputs(ui: &mut Ui, rt: &CellRuntime, renderer: &mut Renderer) {
                     });
                 }
                 let color = if rt.error_stale {
-                    STALE_GREY
+                    p.text_helper
                 } else {
-                    ERROR_RED
+                    p.danger
                 };
                 let error = strip_ansi(error);
                 ui.add(
@@ -828,25 +1294,26 @@ fn draw_outputs(ui: &mut Ui, rt: &CellRuntime, renderer: &mut Renderer) {
                 ui.label(
                     RichText::new("interrupted (Sage process group reset)")
                         .small()
-                        .color(STDERR_ORANGE),
+                        .color(p.warning),
                 );
             }
         });
 }
 
 fn draw_live_output(ui: &mut Ui, output: &LiveOutput, renderer: &mut Renderer) {
+    let p = CarbonPalette::of(ui);
     match output {
         LiveOutput::Stream { name, text, stale } => {
             let color = if *stale {
-                STALE_GREY
+                p.text_helper
             } else if *name == StreamName::Stderr {
-                STDERR_ORANGE
+                p.warning
             } else {
-                Color32::from_rgb(40, 40, 40)
+                p.text_primary
             };
             ui.horizontal_wrapped(|ui| {
                 if *name == StreamName::Stderr {
-                    ui.label(RichText::new("stderr").small().color(STDERR_ORANGE));
+                    ui.label(RichText::new("stderr").small().color(p.warning));
                 }
                 if *stale {
                     stale_tag(ui);
@@ -861,9 +1328,9 @@ fn draw_live_output(ui: &mut Ui, output: &LiveOutput, renderer: &mut Renderer) {
             stale,
         } => {
             let color = if *stale {
-                STALE_GREY
+                p.text_helper
             } else {
-                Color32::from_rgb(40, 40, 40)
+                p.text_primary
             };
             let Some((mime, data)) = preferred_mime(bundle) else {
                 // Forward compatibility: a future backend can add a mimetype
@@ -908,7 +1375,7 @@ fn draw_live_output(ui: &mut Ui, output: &LiveOutput, renderer: &mut Renderer) {
                     ui.label(
                         RichText::new("HTML output — not supported in this prototype")
                             .small()
-                            .color(color),
+                            .color(p.text_secondary),
                     );
                 }
             }
@@ -959,12 +1426,13 @@ fn draw_latex(
             add_visual(ui, display, image);
         }
         Err(error) => {
+            let p = CarbonPalette::of(ui);
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("unrendered").small().color(ERROR_RED))
+                ui.label(RichText::new("unrendered").small().color(p.danger))
                     .on_hover_text(error.to_string());
                 ui.label(RichText::new("RaTeX fallback").small().weak());
             });
-            let color = if stale { STALE_GREY } else { color };
+            let color = if stale { p.text_helper } else { color };
             ui.add(egui::Label::new(RichText::new(latex).monospace().color(color)).wrap());
         }
     }
@@ -978,13 +1446,14 @@ fn draw_svg(
     stale: bool,
     color: Color32,
 ) {
+    let p = CarbonPalette::of(ui);
     let ppp = ui.ctx().pixels_per_point();
     match renderer.svg(ui.ctx(), data, ppp) {
         Ok(rendered) => {
             let size = fit_image_size(ui, rendered.size);
             let mut image = egui::Image::new(&rendered.texture).fit_to_exact_size(size);
             if stale {
-                image = image.tint(STALE_GREY);
+                image = image.tint(p.text_helper);
             }
             add_visual(ui, display, image);
         }
@@ -992,11 +1461,11 @@ fn draw_svg(
             ui.label(
                 RichText::new("SVG could not be rendered")
                     .small()
-                    .color(ERROR_RED),
+                    .color(p.danger),
             )
             .on_hover_text(error.to_string());
             let preview: String = data.chars().take(240).collect();
-            let color = if stale { STALE_GREY } else { color };
+            let color = if stale { p.text_helper } else { color };
             ui.add(
                 egui::Label::new(RichText::new(preview).monospace().small().color(color)).wrap(),
             );
@@ -1005,13 +1474,14 @@ fn draw_svg(
 }
 
 fn draw_png(ui: &mut Ui, renderer: &mut Renderer, data: &str, display: DisplayMode, stale: bool) {
+    let p = CarbonPalette::of(ui);
     let ppp = ui.ctx().pixels_per_point();
     match renderer.png(ui.ctx(), data, ppp) {
         Ok(rendered) => {
             let size = fit_image_size(ui, rendered.size);
             let mut image = egui::Image::new(&rendered.texture).fit_to_exact_size(size);
             if stale {
-                image = image.tint(STALE_GREY);
+                image = image.tint(p.text_helper);
             }
             add_visual(ui, display, image);
         }
@@ -1019,7 +1489,7 @@ fn draw_png(ui: &mut Ui, renderer: &mut Renderer, data: &str, display: DisplayMo
             ui.label(
                 RichText::new("PNG could not be decoded")
                     .small()
-                    .color(ERROR_RED),
+                    .color(p.danger),
             )
             .on_hover_text(error.to_string());
         }
@@ -1048,7 +1518,43 @@ fn preferred_mime(bundle: &MimeBundle) -> Option<(MimeType, &str)> {
 }
 
 fn stale_tag(ui: &mut Ui) {
-    ui.label(RichText::new("stale").small().color(STALE_GREY).italics());
+    let p = CarbonPalette::of(ui);
+    ui.label(
+        RichText::new("stale")
+            .small()
+            .color(p.text_helper)
+            .italics(),
+    );
+}
+
+/// Start (in characters) of the dotted identifier that ends at `cursor`.
+/// Used for Tab completion; a token may contain `.` so `a.bi` is replaced as
+/// a whole by the driver's `a.bit_length` candidate.
+pub fn completion_token_start(source: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = source.chars().collect();
+    let mut start = cursor.min(chars.len());
+    while start > 0 {
+        let ch = chars[start - 1];
+        if ch.is_alphanumeric() || ch == '_' || ch == '.' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    start
+}
+
+/// Replace the character range `[start, end)` with `insert`, returning the new
+/// source and the caret position (in characters) after the insertion.
+pub fn apply_completion(source: &str, start: usize, end: usize, insert: &str) -> (String, usize) {
+    let chars: Vec<char> = source.chars().collect();
+    let len = chars.len();
+    let start = start.min(len);
+    let end = end.clamp(start, len);
+    let mut out: String = chars[..start].iter().collect();
+    out.push_str(insert);
+    out.extend(chars[end..].iter());
+    (out, start + insert.chars().count())
 }
 
 pub fn format_duration(duration: Duration) -> String {
@@ -1106,6 +1612,61 @@ mod tests {
         assert_eq!(data, "2");
     }
 
+    #[test]
+    fn completion_token_covers_dotted_identifiers() {
+        assert_eq!(completion_token_start("pri", 3), 0);
+        assert_eq!(completion_token_start("a.bi", 4), 0);
+        assert_eq!(completion_token_start("foo(a.bi", 8), 4);
+        assert_eq!(completion_token_start("x = ", 4), 4);
+        // Characters, not bytes: the token starts after the non-ASCII prefix.
+        assert_eq!(completion_token_start("π + si", 6), 4);
+    }
+
+    #[test]
+    fn completion_replaces_only_the_token_and_moves_the_caret() {
+        let (source, cursor) = apply_completion("a = pri", 4, 7, "print(");
+        assert_eq!(source, "a = print(");
+        assert_eq!(cursor, 10);
+
+        let (source, cursor) = apply_completion("obj.bi", 0, 6, "obj.bit_length");
+        assert_eq!(source, "obj.bit_length");
+        assert_eq!(cursor, 14);
+
+        // Out-of-range ranges are clamped instead of panicking.
+        let (source, _) = apply_completion("x", 9, 12, "tail");
+        assert_eq!(source, "xtail");
+    }
+
+    #[test]
+    fn carbon_palettes_have_contrasting_text_and_canvas() {
+        let light = crate::settings::CarbonPalette::light();
+        let dark = crate::settings::CarbonPalette::dark();
+        assert!(!light.dark_mode);
+        assert!(dark.dark_mode);
+        assert_ne!(light.bg, light.text_primary);
+        assert_ne!(dark.bg, dark.text_primary);
+        // Carbon focus is Blue 60 in the light theme.
+        assert_eq!(light.interactive, crate::settings::carbon::BLUE_60);
+    }
+
+    #[test]
+    fn central_panel_uses_the_carbon_canvas_not_the_clear_color() {
+        let ctx = test_context();
+        crate::settings::apply_with_palette(&crate::settings::Settings::default(), &ctx);
+        let frame = egui::Frame::central_panel(&ctx.style());
+        assert_eq!(frame.fill, crate::settings::carbon::WHITE);
+        assert_ne!(frame.fill, egui::Color32::TRANSPARENT);
+    }
+
+    /// A context with the bundled IBM Plex faces installed.  The real app
+    /// installs them in `App::new`; headless UI tests must do the same or the
+    /// named Medium/SemiBold families panic inside epaint.
+    fn test_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        crate::settings::install_fonts(&ctx);
+        ctx
+    }
+
     fn test_input() -> egui::RawInput {
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1141,6 +1702,9 @@ mod tests {
                         syntax,
                         renderer,
                         actions,
+                        bindings: &crate::settings::Keybindings::jupyter(),
+                        selected: None,
+                        scroll_to_cell: &mut None,
                     },
                 );
             });
@@ -1167,7 +1731,7 @@ mod tests {
         let mut actions = Vec::new();
         let syntax = SyntaxAssets::new();
         let mut renderer = Renderer::new();
-        let ctx = egui::Context::default();
+        let ctx = test_context();
         draw_notebook_frame(
             &ctx,
             &mut notebook,
@@ -1233,7 +1797,7 @@ mod tests {
         let mut actions = Vec::new();
         let syntax = SyntaxAssets::new();
         let mut renderer = Renderer::new();
-        let ctx = egui::Context::default();
+        let ctx = test_context();
         draw_notebook_frame(
             &ctx,
             &mut notebook,
@@ -1259,7 +1823,7 @@ mod tests {
         let mut actions = Vec::new();
         let syntax = SyntaxAssets::new();
         let mut renderer = Renderer::new();
-        let ctx = egui::Context::default();
+        let ctx = test_context();
         // Frame one grants focus to the editor.
         draw_notebook_frame(
             &ctx,
@@ -1305,7 +1869,7 @@ mod tests {
 
     #[test]
     fn menu_and_status_render_headless() {
-        let ctx = egui::Context::default();
+        let ctx = test_context();
         let menu = MenuState {
             backend_ready: true,
             starting: false,
@@ -1337,13 +1901,6 @@ mod tests {
     }
 
     #[test]
-    fn ages_are_compact() {
-        assert_eq!(format_age(Duration::from_millis(500)), "just now");
-        assert_eq!(format_age(Duration::from_secs(2)), "2s ago");
-        assert_eq!(format_age(Duration::from_secs(125)), "2m ago");
-    }
-
-    #[test]
     fn inspector_panel_renders_headless() {
         let vars = vec![
             VarInfo {
@@ -1361,12 +1918,11 @@ mod tests {
             vars: &vars,
             loading: false,
             error: None,
-            last_updated: Some(Instant::now()),
             backend_ready: true,
             starting: false,
             blocked_running: false,
         };
-        let ctx = egui::Context::default();
+        let ctx = test_context();
         let _ = ctx.run(test_input(), |ctx| {
             let action = inspector_panel(ctx, &state);
             assert!(action.is_none());
@@ -1379,7 +1935,6 @@ mod tests {
             vars: &[],
             loading: true,
             error: None,
-            last_updated: None,
             backend_ready: true,
             starting: false,
             blocked_running: false,

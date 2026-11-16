@@ -51,6 +51,7 @@ struct Args {
     ready_timeout: Duration,
     eval_timeout: Option<Duration>,
     introspect: bool,
+    docs: bool,
     raw: bool,
     verbose: bool,
     strict: bool,
@@ -72,6 +73,7 @@ impl Default for Args {
             ready_timeout: Duration::from_secs(90),
             eval_timeout: Some(Duration::from_secs(120)),
             introspect: false,
+            docs: false,
             raw: false,
             verbose: false,
             strict: false,
@@ -150,6 +152,9 @@ fn run() -> Result<i32, String> {
 
     if runner.args.introspect && !runner.fatal {
         runner.request_introspection();
+    }
+    if runner.args.docs && !runner.fatal {
+        runner.request_docs();
     }
 
     if runner.fatal {
@@ -514,6 +519,37 @@ impl Runner {
         }
         eprintln!("sadrive: timed out waiting for introspection");
     }
+
+    fn request_docs(&mut self) {
+        let cell = CellId::new();
+        if let Err(err) = self.backend.docs(cell, "plot", 4) {
+            eprintln!("sadrive: docs request failed: {err:#}");
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            match self.events.recv_timeout(Duration::from_millis(100)) {
+                Ok(event) => {
+                    let mut finished = false;
+                    let mut had_error = false;
+                    let is_doc = matches!(
+                        &event,
+                        BackendEvent::Frame(Frame::Doc { id, .. }) if *id == cell
+                    );
+                    self.handle_event(event, None, &mut finished, &mut had_error);
+                    if is_doc {
+                        return;
+                    }
+                    if self.fatal {
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        eprintln!("sadrive: timed out waiting for documentation");
+    }
 }
 
 fn print_frame(frame: &Frame, current: Option<(CellId, RunId)>) {
@@ -564,6 +600,26 @@ fn print_frame(frame: &Frame, current: Option<(CellId, RunId)>) {
             for var in vars {
                 println!("  {:<20} {:<20} {}", var.name, var.type_name, var.value);
             }
+        }
+        Frame::Complete { id, offset, items } => {
+            println!("complete cell={id} offset={offset} ({} items)", items.len());
+            for item in items {
+                println!("  {item}");
+            }
+        }
+        Frame::Doc {
+            id,
+            offset,
+            name,
+            type_name,
+            signature,
+            text,
+        } => {
+            println!("doc cell={id} offset={offset} name={name} type={type_name}");
+            if !signature.is_empty() {
+                println!("  signature: {signature}");
+            }
+            print_block(text, 8_000);
         }
         Frame::End { id, run } => println!("end cell={id} run={run}"),
         Frame::Pong => println!("pong"),
@@ -685,6 +741,7 @@ fn parse_args() -> Result<Args, String> {
                 args.eval_timeout = (!value.is_zero()).then_some(value);
             }
             "--introspect" => args.introspect = true,
+            "--docs" => args.docs = true,
             "--raw" | "--json" => args.raw = true,
             "--verbose" | "-v" => args.verbose = true,
             "--strict" => args.strict = true,
@@ -757,6 +814,7 @@ EVALUATION:
     --ready-timeout S      ready handshake timeout (default 90)
     --eval-timeout S       per-cell wall clock before SIGINT; 0 disables (default 120)
     --introspect           request the variable inspector once at the end
+    --docs                 request documentation for `plot` once at the end
 
 OUTPUT:
     --raw, --json          print one JSON frame per line (lifecycle notes on stderr)

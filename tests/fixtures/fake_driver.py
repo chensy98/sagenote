@@ -121,6 +121,49 @@ def introspect(request_id):
     )
 
 
+_COMPLETIONS = ["print(", "println(", "property("]
+
+
+def complete(cell_id, source, offset):
+    """Canned prefix completion, enough to exercise Tab end to end."""
+    text = source[:offset]
+    token = []
+    for ch in reversed(text):
+        if ch.isalnum() or ch == "_" or ch == ".":
+            token.append(ch)
+        else:
+            break
+    token = "".join(reversed(token))
+    if token and not token.startswith("."):
+        items = [item for item in _COMPLETIONS if item.startswith(token)]
+    else:
+        items = []
+    send({"type": "complete", "id": cell_id, "offset": offset, "items": items})
+
+
+def docs(cell_id, source, offset):
+    """Canned documentation for the name at the caret."""
+    text = source[:offset]
+    token = []
+    for ch in reversed(text):
+        if ch.isalnum() or ch == "_" or ch == ".":
+            token.append(ch)
+        else:
+            break
+    token = "".join(reversed(token))
+    send(
+        {
+            "type": "doc",
+            "id": cell_id,
+            "offset": offset,
+            "name": token,
+            "kind": "function",
+            "signature": "print(value, ..., sep=' ', end='\\n')",
+            "text": "Print `value` to the text stream.\n\nCanned documentation from the fake driver.",
+        }
+    )
+
+
 def main():
     global _display
     send({"type": "ready", "sage_version": "fake-1.0"})
@@ -137,6 +180,10 @@ def main():
             evaluate(message["id"], message["run"], message.get("source", ""))
         elif op == "introspect":
             introspect(message["id"])
+        elif op == "complete":
+            complete(message["id"], message.get("source", ""), message.get("offset", 0))
+        elif op == "doc":
+            docs(message["id"], message.get("source", ""), message.get("offset", 0))
         elif op == "set_display":
             mode = message.get("mode", "block")
             if mode in ("block", "inline"):

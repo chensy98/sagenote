@@ -20,7 +20,8 @@ fn restart(&mut self) -> Result<()>;
 fn eval(&mut self, cell: CellId, run: RunId, source: &str) -> Result<()>;
 fn interrupt(&mut self, scope: InterruptScope) -> Result<()>;   // Cell | Kernel
 fn introspect(&mut self, req: IntrospectId) -> Result<()>;
-fn completion(&mut self, cell: CellId, offset: usize) -> Result<()>;
+fn completion(&mut self, cell: CellId, source: &str, offset: usize) -> Result<()>;
+fn docs(&mut self, cell: CellId, source: &str, offset: usize) -> Result<()>;
 fn declared_mimetypes(&self) -> &[MimeType];
 fn events(&self) -> mpsc::Receiver<BackendEvent>;
 ```
@@ -38,9 +39,10 @@ the only drainer.
 | `src/backend/driver.rs` | Spawn, SIGINT, watchdog, NDJSON parser |
 | `src/cells.rs` | Notebook model, `.sagenote` codec, ipynb hook |
 | `src/platform.rs` | Sage discovery, temp dir, macOS branches |
-| `src/app.rs` | App state, startup, event routing, files, modals |
-| `src/ui.rs` | Menu/status bar, cell workspace, syntect editor |
+| `src/ui.rs` | Menu/status bar, cell workspace, syntect editor, completion popup |
+| `src/app.rs` | App state, startup, event routing, files, docs window, modals |
 | `src/render.rs` | RaTeX/tiny-skia, usvg/resvg, PNG, texture cache |
+| `src/settings.rs` | User settings, keybindings, Carbon palette, embedded IBM Plex fonts |
 | `src/text.rs` | ANSI stripping for displayed output |
 | `src/bin/sadrive.rs` | Headless probe |
 | `sage/driver.py` | The Python driver |
@@ -107,3 +109,9 @@ Ids:
 - `RunId` — monotonic per evaluation. Results route by `(cell, run)` and are
   discarded if the cell is gone or the run was superseded.
 - `IntrospectId` — request id echoed by the `introspect` frame.
+
+Completion is routed by `CellId` plus the character `offset`. A response is
+ignored unless the runtime still remembers the request and the notebook source
+is byte-for-byte the string that was sent; this is what stops a late answer
+from replacing text the user typed after pressing Tab. Documentation (`doc`)
+uses the same request/source guard and opens a non-modal floating window.

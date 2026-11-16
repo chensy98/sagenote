@@ -13,6 +13,8 @@ per line, Jupyter-shaped:
 | `result` | `id`, `run`, `bundle`, `display`: `block`/`inline` |
 | `error` | `id`, `run`, `traceback` |
 | `introspect` | `id`, `vars`: `[{name,type,value}]` |
+| `complete` | `id`, `offset`, `items`: candidate strings for the token at `offset` |
+| `doc` | `id`, `offset`, `name`, `kind`, `signature`, `text`: docstring for the name |
 | `end` | `id`, `run` |
 | `pong` | auxiliary liveness answer to `ping`; never cell output |
 
@@ -21,8 +23,11 @@ Mimetypes in a bundle: `text/latex`, `image/svg+xml`, `image/png` (base64),
 by `MimeBundle`; unknown frame types parse to `Frame::Unknown` and do not kill
 the session.
 
-Stdin requests: `{"op":"eval"|"introspect"|"set_display"|"ping"}`.
-`set_display` carries `mode`: `block`|`inline`.
+Stdin requests: `{"op":"eval"|"introspect"|"complete"|"doc"|"set_display"|"ping"}`.
+`set_display` carries `mode`: `block`|`inline`. `complete` and `doc` carry the
+cell `id`, the whole cell `source`, and the caret `offset` in characters; the
+driver extracts the dotted identifier ending there. `doc` returns the plain
+docstring plus name/kind/signature; the UI renders it (no HTML/WebView).
 
 ## Framing rationale
 
@@ -68,6 +73,15 @@ off; and pasting a multi-line block requires continuation handling.
   truncated base64.
 - Sources `$SAGE_STARTUP_FILE` / `~/.sage/init.sage` explicitly, because
   `sage -python` does not.
+- Answers `complete` with prefix/attribute candidates from the live namespace
+  (`rlcompleter`, capped at 200). Driver internals and Sage dunders are hidden
+  unless the user is explicitly completing a private name. Completion is
+  advisory: exceptions produce an empty list, never an error frame.
+- Answers `doc` with `inspect.getdoc` for the dotted name at the caret, plus
+  the object's type and signature. Resolution and docstring access are wrapped;
+  a hostile descriptor or missing name produces a normal text answer, never a
+  crashed driver. `DisplayManager` objects (the `dm` that `init.sage` often
+  creates) are filtered from introspection and completion.
 
 ### Sage CLI compatibility
 

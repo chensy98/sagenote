@@ -21,7 +21,11 @@ use sagenote::platform::{self, DiscoveryError, DiscoveryFailure, DiscoverySource
 use tokio::runtime::{Handle, Runtime};
 
 use crate::render::Renderer;
-use crate::ui::{self, MenuState, NotebookUi, StatusState, SyntaxAssets, UiAction};
+use crate::settings::{
+    binding_display, default_binding, format_binding, parse_binding, CarbonPalette, KeyPress,
+    Keybindings, Settings, ThemeMode, BINDING_META,
+};
+use crate::ui::{self, MenuState, NotebookUi, StatusState, SyntaxAssets, ToolbarState, UiAction};
 
 /// One live output block.  The notebook's serialized `SavedOutput` is the
 /// on-disk projection; this is the display/runtime representation.
@@ -54,6 +58,45 @@ impl LiveOutput {
     }
 }
 
+/// A completion request waiting for the driver's answer.  The source is kept
+/// verbatim so a response that arrives after an edit is discarded instead of
+/// replacing text the user changed in the meantime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionRequest {
+    pub source: String,
+    /// Character offset of the caret when Tab was pressed.
+    pub offset: usize,
+    /// Character offset where the completed token starts.
+    pub start: usize,
+}
+
+/// A documentation request waiting for the driver's answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocRequest {
+    pub source: String,
+    pub offset: usize,
+}
+
+/// The floating documentation window.
+#[derive(Clone, Debug)]
+pub struct DocPopup {
+    pub cell: CellId,
+    pub name: String,
+    pub type_name: String,
+    pub signature: String,
+    pub text: String,
+}
+
+/// An open Tab-completion popup.  `start..end` is the character range that
+/// accepting the selected candidate will replace.
+#[derive(Clone, Debug)]
+pub struct CompletionPopup {
+    pub items: Vec<String>,
+    pub selected: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
 /// Runtime state for one cell.  It is deliberately separate from [`Cell`] so a
 /// transient `running` state never has to be serialized mid-execution.
 #[derive(Clone, Debug, Default)]
@@ -65,6 +108,16 @@ pub struct CellRuntime {
     pub outputs: Vec<LiveOutput>,
     pub error: Option<String>,
     pub error_stale: bool,
+    /// Jupyter-style execution count, assigned when a run starts.
+    pub execution_count: Option<u64>,
+    /// A Tab-completion request sent to the driver and not answered yet.
+    pub completion_request: Option<CompletionRequest>,
+    /// Candidates currently shown in the completion popup.
+    pub completion_popup: Option<CompletionPopup>,
+    /// Replacement staged for the next UI frame: (start, end, text).
+    pub pending_completion: Option<(usize, usize, String)>,
+    /// A documentation request sent to the driver and not answered yet.
+    pub doc_request: Option<DocRequest>,
 }
 
 impl CellRuntime {
@@ -90,6 +143,8 @@ impl CellRuntime {
             outputs,
             error: None,
             error_stale: false,
+            execution_count: cell.execution_count,
+            ..Default::default()
         }
     }
 
@@ -101,6 +156,11 @@ impl CellRuntime {
         self.outputs.clear();
         self.error = None;
         self.error_stale = false;
+        self.execution_count = Some(run.0);
+        self.completion_request = None;
+        self.completion_popup = None;
+        self.pending_completion = None;
+        self.doc_request = None;
     }
 
     fn start(&mut self, run: RunId) {
@@ -253,6 +313,17 @@ struct ErrorDialog {
     recovery: bool,
 }
 
+/// Shortcut recorder state for the settings dialog.
+struct Recording {
+    /// The binding id (a [`crate::settings::BINDING_META`] entry) being recorded.
+    action: &'static str,
+    /// Presses captured so far.
+    presses: Vec<crate::settings::KeyPress>,
+    /// How many presses complete the binding: 1 for a simple binding, the
+    /// sequence length for a double-press binding such as `d d`.
+    expected: usize,
+}
+
 pub struct App {
     notebook: Notebook,
     cells: HashMap<CellId, CellRuntime>,
@@ -285,11 +356,25 @@ pub struct App {
     inspector_vars: Vec<VarInfo>,
     inspector_error: Option<String>,
     inspector_last_request: Option<Instant>,
-    inspector_last_update: Option<Instant>,
     introspect_in_flight: Option<IntrospectId>,
+    doc_popup: Option<DocPopup>,
     next_introspect: u64,
     tokio: Option<Runtime>,
     tokio_handle: Option<Handle>,
+    settings: Settings,
+    settings_open: bool,
+    shortcuts_open: bool,
+    recording: Option<Recording>,
+    /// Jupyter command-mode selection: the cell `A`/`B`/`D D` act on.
+    selected_cell: Option<CellId>,
+    /// Scroll this cell into view on the next frame (set on selection moves).
+    scroll_to_cell: Option<CellId>,
+    /// `(index, cell)` of the last deleted cell, for command-mode `Z`.
+    last_deleted: Option<(usize, Cell)>,
+    /// Internal cell cut/copy buffer for command-mode `X`/`C`/`V`.
+    cell_clipboard: Option<Cell>,
+    /// First key of an in-progress sequence binding (`D D`, `I I`, `0 0`).
+    sequence_pending: Option<(egui::Key, Instant)>,
 }
 
 /// A backend evaluation can still be active after the user edits or deletes
@@ -307,7 +392,9 @@ impl App {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        configure_style(&cc.egui_ctx);
+        let settings = crate::settings::load_settings();
+        crate::settings::install_fonts(&cc.egui_ctx);
+        crate::settings::apply_with_palette(&settings, &cc.egui_ctx);
         let tokio = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -319,6 +406,7 @@ impl App {
             cells.insert(cell.id, CellRuntime::from_saved(cell));
         }
         let focus_request = notebook.cells.first().map(|cell| cell.id);
+        let selected_cell = focus_request;
         let mut app = Self {
             notebook,
             cells,
@@ -351,11 +439,20 @@ impl App {
             inspector_vars: Vec::new(),
             inspector_error: None,
             inspector_last_request: None,
-            inspector_last_update: None,
             introspect_in_flight: None,
+            doc_popup: None,
             next_introspect: 1,
             tokio: Some(tokio),
             tokio_handle: Some(tokio_handle),
+            settings,
+            settings_open: false,
+            shortcuts_open: false,
+            recording: None,
+            selected_cell,
+            scroll_to_cell: None,
+            last_deleted: None,
+            cell_clipboard: None,
+            sequence_pending: None,
         };
         app.push_log("starting Sage discovery");
         app.start_backend(&cc.egui_ctx, StartupMode::Discover);
@@ -737,7 +834,6 @@ impl App {
     fn clear_inspector(&mut self, error: Option<&str>) {
         self.introspect_in_flight = None;
         self.inspector_vars.clear();
-        self.inspector_last_update = None;
         self.inspector_last_request = None;
         self.inspector_error = error.map(str::to_owned);
     }
@@ -781,9 +877,13 @@ impl App {
         {
             return;
         }
+        let interval = self.settings.inspector_refresh_secs;
+        if interval == 0 {
+            return;
+        }
         let due = self
             .inspector_last_request
-            .is_none_or(|last| last.elapsed() >= Duration::from_secs(2));
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(interval));
         if due {
             self.request_inspector();
         }
@@ -806,7 +906,6 @@ impl App {
                 vars: &self.inspector_vars,
                 loading: self.introspect_in_flight.is_some(),
                 error: self.inspector_error.as_deref(),
-                last_updated: self.inspector_last_update,
                 backend_ready,
                 starting: self.starting,
                 blocked_running: running,
@@ -919,10 +1018,12 @@ impl App {
                 self.mark_running_interrupted();
                 self.mark_session_outputs_stale();
             }
-            BackendEvent::Completion { cell, offset, .. } => {
-                self.push_log(format!(
-                    "completion hook: cell={cell} offset={offset} (no LSP in this prototype)"
-                ));
+            BackendEvent::Completion {
+                cell,
+                offset,
+                items,
+            } => {
+                self.apply_completion(cell, offset, items);
             }
             BackendEvent::Stderr { text } => {
                 self.push_log(format!("[driver stderr] {}", text.trim_end()));
@@ -1036,7 +1137,6 @@ impl App {
                     let changed = self.inspector_vars != vars;
                     self.inspector_vars = vars;
                     self.inspector_error = None;
-                    self.inspector_last_update = Some(Instant::now());
                     log::debug!(
                         "inspector: {} variable(s) from introspection {id}",
                         self.inspector_vars.len()
@@ -1050,6 +1150,21 @@ impl App {
                 } else {
                     self.push_log(format!("ignored stale introspection {id}"));
                 }
+            }
+            Frame::Complete { .. } => {
+                // The supervisor converts `complete` frames into
+                // `BackendEvent::Completion`; a raw frame here is unexpected.
+                self.push_log("ignored a raw complete frame");
+            }
+            Frame::Doc {
+                id,
+                offset,
+                name,
+                type_name,
+                signature,
+                text,
+            } => {
+                self.apply_doc(id, offset, name, type_name, signature, text);
             }
             Frame::Ready { sage_version } => {
                 self.push_log(format!("driver ready frame: {sage_version}"));
@@ -1071,10 +1186,17 @@ impl App {
     fn mark_session_outputs_stale(&mut self) {
         for rt in self.cells.values_mut() {
             rt.mark_stale();
+            // A dead/restarted driver will never answer an outstanding Tab
+            // request; clear it so the next Tab is accepted.
+            rt.completion_request = None;
+            rt.completion_popup = None;
+            rt.pending_completion = None;
+            rt.doc_request = None;
             if matches!(rt.state, CellState::Ok | CellState::Error) {
                 rt.state = CellState::Idle;
             }
         }
+        self.doc_popup = None;
     }
 
     fn mark_running_interrupted(&mut self) {
@@ -1114,6 +1236,7 @@ impl App {
         }
         self.set_cell_state(id, CellState::Queued);
         self.last_focused = Some(id);
+        self.selected_cell = Some(id);
         if let Some(backend) = &mut self.backend {
             if let Err(error) = backend.eval(id, run, &source) {
                 if let Some(rt) = self.cells.get_mut(&id) {
@@ -1160,13 +1283,176 @@ impl App {
         self.focus_request = Some(id);
     }
 
+    /// Shift+Enter: run the cell, then select the next cell (Jupyter).  When
+    /// the run cell is the last one, a new cell is inserted below it.
+    fn run_and_advance(&mut self, id: CellId) {
+        self.run_cell(id);
+        let Some(index) = self.notebook.cell_index(id) else {
+            return;
+        };
+        match self.notebook.cells.get(index + 1) {
+            Some(next) => self.select_cell(next.id),
+            None => {
+                let new_id = self.notebook.insert_cell_after(Some(id), "");
+                self.cells.insert(new_id, CellRuntime::default());
+                self.select_cell(new_id);
+            }
+        }
+    }
+
+    /// Alt+Enter: run the cell and insert (and select) a new cell below it.
+    fn run_and_insert_below(&mut self, id: CellId) {
+        self.run_cell(id);
+        let new_id = self.notebook.insert_cell_after(Some(id), "");
+        self.cells.insert(new_id, CellRuntime::default());
+        self.select_cell(new_id);
+    }
+
+    /// Select `id` and scroll it into view on the next frame.
+    fn select_cell(&mut self, id: CellId) {
+        self.selected_cell = Some(id);
+        self.scroll_to_cell = Some(id);
+    }
+
+    /// Command-mode `Enter`: enter the editor of the selected cell.
+    fn edit_selected(&mut self) {
+        if let Some(id) = self.selected_cell {
+            self.focus_request = Some(id);
+        }
+    }
+
+    fn select_prev(&mut self) {
+        let Some(id) = self.selected_cell else { return };
+        let Some(index) = self.notebook.cell_index(id) else {
+            return;
+        };
+        if index > 0 {
+            let prev = self.notebook.cells[index - 1].id;
+            self.select_cell(prev);
+        }
+    }
+
+    fn select_next(&mut self) {
+        let Some(id) = self.selected_cell else { return };
+        let Some(index) = self.notebook.cell_index(id) else {
+            return;
+        };
+        if let Some(next) = self.notebook.cells.get(index + 1) {
+            self.select_cell(next.id);
+        }
+    }
+
+    /// Command-mode `A`/`B`: insert a cell relative to the selection and
+    /// select the new cell.
+    fn insert_relative(&mut self, above: bool) {
+        let anchor = self
+            .selected_cell
+            .or_else(|| self.notebook.cells.last().map(|cell| cell.id));
+        let Some(anchor) = anchor else {
+            return;
+        };
+        let after = if above {
+            let index = self.notebook.cell_index(anchor).unwrap_or(0);
+            if index == 0 {
+                None
+            } else {
+                Some(self.notebook.cells[index - 1].id)
+            }
+        } else {
+            Some(anchor)
+        };
+        let id = self.notebook.insert_cell_after(after, "");
+        self.cells.insert(id, CellRuntime::default());
+        self.select_cell(id);
+    }
+
+    /// Command-mode `Z`: undo the last cell deletion.
+    fn undo_delete(&mut self) {
+        let Some((index, cell)) = self.last_deleted.take() else {
+            return;
+        };
+        let id = cell.id;
+        let index = index.min(self.notebook.cells.len());
+        self.notebook.cells.insert(index, cell);
+        self.cells.insert(id, CellRuntime::default());
+        self.notebook.dirty = true;
+        self.select_cell(id);
+    }
+
+    /// Command-mode `X` (cut) / `C` (copy) the selected cell.
+    fn cut_or_copy_selected(&mut self, cut: bool) {
+        let Some(id) = self.selected_cell else { return };
+        if cut {
+            let Some(index) = self.notebook.cell_index(id) else {
+                return;
+            };
+            if let Some(cell) = self.notebook.remove_cell(id) {
+                self.cells.remove(&id);
+                self.cell_clipboard = Some(cell.clone());
+                self.last_deleted = Some((index, cell));
+                self.notebook.dirty = true;
+                let next = self
+                    .notebook
+                    .cells
+                    .get(index)
+                    .or_else(|| self.notebook.cells.last());
+                if let Some(next) = next {
+                    self.select_cell(next.id);
+                } else {
+                    self.selected_cell = None;
+                }
+            }
+        } else if let Some(cell) = self.notebook.cell(id) {
+            self.cell_clipboard = Some(cell.clone());
+        }
+    }
+
+    /// Command-mode `V`/`Shift+V`: paste the clipboard cell below/above the
+    /// selection.  The pasted cell gets a fresh id and is selected.
+    fn paste_clipboard(&mut self, above: bool) {
+        let Some(clipboard_cell) = self.cell_clipboard.clone() else {
+            return;
+        };
+        let anchor = self
+            .selected_cell
+            .or_else(|| self.notebook.cells.last().map(|cell| cell.id));
+        let Some(anchor) = anchor else { return };
+        let after = if above {
+            let index = self.notebook.cell_index(anchor).unwrap_or(0);
+            if index == 0 {
+                None
+            } else {
+                Some(self.notebook.cells[index - 1].id)
+            }
+        } else {
+            Some(anchor)
+        };
+        let new_id = self.notebook.insert_cell_after(after, "");
+        let pasted = Cell {
+            id: new_id,
+            source: clipboard_cell.source.clone(),
+            outputs: clipboard_cell.outputs.clone(),
+            state: clipboard_cell.state,
+            execution_count: clipboard_cell.execution_count,
+        };
+        if let Some(cell) = self.notebook.cell_mut(new_id) {
+            *cell = pasted;
+        }
+        self.cells.insert(new_id, CellRuntime::default());
+        self.select_cell(new_id);
+    }
+
     fn delete_cell(&mut self, id: CellId) {
         let Some(index) = self.notebook.cell_index(id) else {
             return;
         };
-        self.notebook.remove_cell(id);
+        if let Some(cell) = self.notebook.remove_cell(id) {
+            self.last_deleted = Some((index, cell));
+        }
         self.cells.remove(&id);
-        self.renderer.clear();
+        if self.doc_popup.as_ref().is_some_and(|doc| doc.cell == id) {
+            self.doc_popup = None;
+        }
         if self.active.map(|(active, _)| active) == Some(id) {
             // Keep the active pair so Stream frames are discarded (the cell is
             // gone) and End clears it; do not attach output to another cell.
@@ -1176,9 +1462,12 @@ impl App {
             self.notebook.dirty = true;
             self.cells.insert(new_id, CellRuntime::default());
             self.focus_request = Some(new_id);
+            self.selected_cell = Some(new_id);
         } else {
-            let next = index.min(self.notebook.cells.len() - 1);
-            self.focus_request = Some(self.notebook.cells[next].id);
+            let next_index = index.min(self.notebook.cells.len() - 1);
+            let next_id = self.notebook.cells[next_index].id;
+            self.focus_request = Some(next_id);
+            self.select_cell(next_id);
         }
     }
 
@@ -1189,7 +1478,7 @@ impl App {
             self.notebook.move_cell_down(id)
         };
         if moved {
-            self.focus_request = Some(id);
+            self.select_cell(id);
         }
     }
 
@@ -1201,6 +1490,158 @@ impl App {
                 self.push_log("SIGINT sent to the Sage process group");
             }
         }
+    }
+
+    /// Ask the driver for prefix completions of the token at `offset`.
+    ///
+    /// The driver is single-threaded, so completion is suppressed while a cell
+    /// is queued/running: otherwise the request would sit behind the eval and
+    /// the popup could replace text the user has already moved on from.
+    fn request_completion(&mut self, cell: CellId, source: String, offset: usize, start: usize) {
+        if !self.backend_ready() || self.any_running() {
+            return;
+        }
+        {
+            let Some(rt) = self.cells.get_mut(&cell) else {
+                return;
+            };
+            if rt.completion_request.is_some() {
+                return;
+            }
+            rt.completion_popup = None;
+            rt.pending_completion = None;
+            rt.completion_request = Some(CompletionRequest {
+                source: source.clone(),
+                offset,
+                start,
+            });
+        }
+        let result = match self.backend.as_mut() {
+            Some(backend) => backend.completion(cell, &source, offset),
+            None => {
+                if let Some(rt) = self.cells.get_mut(&cell) {
+                    rt.completion_request = None;
+                }
+                return;
+            }
+        };
+        if let Err(error) = result {
+            if let Some(rt) = self.cells.get_mut(&cell) {
+                rt.completion_request = None;
+            }
+            self.push_log(format!("completion request failed: {error:#}"));
+        }
+    }
+
+    /// Turn a driver answer into either a direct insertion (one candidate) or
+    /// the popup.  Stale answers are dropped: the source must still be exactly
+    /// what was sent, and the offset must match.
+    fn apply_completion(&mut self, cell: CellId, offset: usize, items: Vec<String>) {
+        let Some(rt) = self.cells.get_mut(&cell) else {
+            return;
+        };
+        let Some(request) = rt.completion_request.take() else {
+            return;
+        };
+        if request.offset != offset {
+            return;
+        }
+        if self.notebook.cell(cell).map(|c| c.source.as_str()) != Some(request.source.as_str()) {
+            return;
+        }
+        let current: String = request
+            .source
+            .chars()
+            .skip(request.start)
+            .take(request.offset - request.start)
+            .collect();
+        let mut items: Vec<String> = items
+            .into_iter()
+            .filter(|item| !item.is_empty() && *item != current)
+            .collect();
+        items.sort();
+        items.dedup();
+        items.truncate(100);
+        match items.len() {
+            0 => {}
+            1 => rt.pending_completion = Some((request.start, request.offset, items.remove(0))),
+            _ => {
+                rt.completion_popup = Some(CompletionPopup {
+                    items,
+                    selected: 0,
+                    start: request.start,
+                    end: request.offset,
+                });
+            }
+        }
+    }
+
+    /// Ask the driver for the docstring of the name at `offset`.  Like
+    /// completion, docs share the single driver thread and are suppressed
+    /// while a cell is running.
+    fn request_docs(&mut self, cell: CellId, source: String, offset: usize) {
+        if !self.backend_ready() || self.any_running() {
+            return;
+        }
+        {
+            let Some(rt) = self.cells.get_mut(&cell) else {
+                return;
+            };
+            if rt.doc_request.is_some() {
+                return;
+            }
+            rt.doc_request = Some(DocRequest {
+                source: source.clone(),
+                offset,
+            });
+        }
+        let result = match self.backend.as_mut() {
+            Some(backend) => backend.docs(cell, &source, offset),
+            None => {
+                if let Some(rt) = self.cells.get_mut(&cell) {
+                    rt.doc_request = None;
+                }
+                return;
+            }
+        };
+        if let Err(error) = result {
+            if let Some(rt) = self.cells.get_mut(&cell) {
+                rt.doc_request = None;
+            }
+            self.push_log(format!("documentation request failed: {error:#}"));
+        }
+    }
+
+    /// Open the docs window for a driver answer, unless the cell changed since
+    /// the request was made.
+    fn apply_doc(
+        &mut self,
+        cell: CellId,
+        offset: usize,
+        name: String,
+        type_name: String,
+        signature: String,
+        text: String,
+    ) {
+        let Some(rt) = self.cells.get_mut(&cell) else {
+            return;
+        };
+        let Some(request) = rt.doc_request.take() else {
+            return;
+        };
+        if request.offset != offset {
+            return;
+        }
+        if self.notebook.cell(cell).map(|c| c.source.as_str()) != Some(request.source.as_str()) {
+            return;
+        }
+        self.doc_popup = Some(DocPopup {
+            cell,
+            name,
+            type_name,
+            signature,
+            text,
+        });
     }
 
     fn retry_backend(&mut self, ctx: &egui::Context) {
@@ -1233,6 +1674,7 @@ impl App {
 
     fn reset_from_notebook(&mut self) {
         self.renderer.clear();
+        self.doc_popup = None;
         self.cells.clear();
         for cell in &self.notebook.cells {
             self.cells.insert(cell.id, CellRuntime::from_saved(cell));
@@ -1240,6 +1682,7 @@ impl App {
         self.active = None;
         self.last_focused = None;
         self.focus_request = self.notebook.cells.first().map(|cell| cell.id);
+        self.selected_cell = self.focus_request;
     }
 
     fn new_notebook(&mut self) {
@@ -1284,6 +1727,7 @@ impl App {
             if let Some(rt) = self.cells.get(&cell.id) {
                 cell.outputs = rt.to_saved_outputs();
                 cell.state = rt.persisted_state();
+                cell.execution_count = rt.execution_count;
             }
         }
     }
@@ -1399,40 +1843,206 @@ impl App {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.error_dialog.is_some() || self.show_unsaved || self.about_open {
+        if self.any_modal_open() {
+            return;
+        }
+        // Escape closes the documentation window before anything else.
+        if self.doc_popup.is_some()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.doc_popup = None;
+            return;
+        }
+        // An open completion popup owns the keyboard (Ctrl+N/Ctrl+P and the
+        // configured next/prev bindings must not trigger New/Open first).
+        if self.cells.values().any(|rt| rt.completion_popup.is_some()) {
             return;
         }
         let command = egui::Modifiers::COMMAND;
-        let command_shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
 
-        if ctx.input_mut(|i| i.consume_key(command_shift, egui::Key::S)) {
+        // Ctrl+= / Ctrl+- / Ctrl+0: UI zoom.  Not user-remappable.
+        if ctx.input_mut(|i| i.consume_key(command, egui::Key::Equals)) {
+            let factor = (ctx.zoom_factor() * 1.1).min(2.5);
+            ctx.set_zoom_factor(factor);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(command, egui::Key::Minus)) {
+            let factor = (ctx.zoom_factor() / 1.1).max(0.5);
+            ctx.set_zoom_factor(factor);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(command, egui::Key::Num0)) {
+            ctx.set_zoom_factor(1.0);
+            return;
+        }
+
+        // Global bindings, most specific first.
+        if ctx.input_mut(|i| i.consume_key(command | egui::Modifiers::SHIFT, egui::Key::S)) {
             self.save_as(ctx);
-            return;
-        }
-        if ctx.input_mut(|i| i.consume_key(command, egui::Key::S)) {
+        } else if ctx.input_mut(|i| i.consume_key(command, egui::Key::S)) {
             self.save(ctx);
-            return;
-        }
-        if ctx.input_mut(|i| i.consume_key(command, egui::Key::N)) {
+        } else if ctx.input_mut(|i| i.consume_key(command, egui::Key::N)) {
             self.request_pending(PendingAction::New, ctx);
-            return;
-        }
-        if ctx.input_mut(|i| i.consume_key(command, egui::Key::O)) {
+        } else if ctx.input_mut(|i| i.consume_key(command, egui::Key::O)) {
             self.request_pending(PendingAction::Open, ctx);
-            return;
-        }
-        if ctx.input_mut(|i| i.consume_key(command, egui::Key::I)) {
+        } else if ctx.input_mut(|i| i.consume_key(command, egui::Key::I)) {
             self.toggle_inspector();
-            return;
-        }
-        if ctx.input_mut(|i| i.consume_key(command, egui::Key::Period)) {
+        } else if ctx.input_mut(|i| i.consume_key(command, egui::Key::Period)) {
             self.interrupt();
-            return;
-        }
-        if ctx.input_mut(|i| {
+        } else if ctx.input_mut(|i| {
             i.consume_key(command, egui::Key::Q) || i.consume_key(command, egui::Key::W)
         }) {
             self.request_pending(PendingAction::Quit, ctx);
+        } else if ctx.input_mut(|i| i.consume_key(command, egui::Key::Comma)) {
+            self.settings_open = true;
+        } else if ctx.input_mut(|i| i.consume_key(command, egui::Key::H)) {
+            self.shortcuts_open = true;
+        } else if self.any_editor_focused(ctx) {
+            // Edit mode: `Esc` and the run bindings are consumed in
+            // `ui::draw_cell`, which owns the focused editor's response.
+        } else {
+            self.handle_command_mode_keys(ctx);
+        }
+    }
+
+    /// Jupyter command mode: no editor focused, one cell selected.
+    fn handle_command_mode_keys(&mut self, ctx: &egui::Context) {
+        let kb = self.settings.keybindings.clone();
+        // Sequences first: D D (delete), I I (interrupt), 0 0 (restart).
+        if self.consume_sequence(ctx, kb.get("delete_cell")) {
+            if let Some(id) = self.selected_cell {
+                self.delete_cell(id);
+            }
+            return;
+        }
+        if self.consume_sequence(ctx, kb.get("interrupt_kernel")) {
+            self.interrupt();
+            return;
+        }
+        if self.consume_sequence(ctx, kb.get("restart_kernel")) {
+            self.handle_action(UiAction::RestartSage, ctx);
+            return;
+        }
+
+        if self.consume_binding(ctx, kb.get("edit_selected")) {
+            self.edit_selected();
+            return;
+        }
+        if self.consume_binding(ctx, kb.get("select_prev")) {
+            self.select_prev();
+            return;
+        }
+        if self.consume_binding(ctx, kb.get("select_next")) {
+            self.select_next();
+            return;
+        }
+        if self.consume_binding(ctx, kb.get("insert_above")) {
+            self.insert_relative(true);
+            return;
+        }
+        if self.consume_binding(ctx, kb.get("insert_below")) {
+            self.insert_relative(false);
+            return;
+        }
+        if self.consume_binding(ctx, kb.get("undo_delete")) {
+            self.undo_delete();
+            return;
+        }
+        if self.consume_binding(ctx, kb.get("cut_cell")) {
+            self.cut_or_copy_selected(true);
+            return;
+        }
+        if self.consume_binding(ctx, kb.get("copy_cell")) {
+            self.cut_or_copy_selected(false);
+            return;
+        }
+        if self.consume_binding(ctx, kb.get("paste_below")) {
+            self.paste_clipboard(false);
+            return;
+        }
+        if self.consume_binding(ctx, kb.get("paste_above")) {
+            self.paste_clipboard(true);
+            return;
+        }
+        if self.consume_binding(ctx, kb.get("show_shortcuts_command")) {
+            self.shortcuts_open = true;
+            return;
+        }
+
+        // Run bindings also work in command mode.
+        if self.consume_binding(ctx, kb.get("run_and_advance")) {
+            if let Some(id) = self.selected_cell {
+                self.run_and_advance(id);
+            }
+            return;
+        }
+        if self.consume_binding(ctx, kb.get("run_in_place")) {
+            if let Some(id) = self.selected_cell {
+                self.run_cell(id);
+            }
+            return;
+        }
+        if self.consume_binding(ctx, kb.get("run_and_insert_below")) {
+            if let Some(id) = self.selected_cell {
+                self.run_and_insert_below(id);
+            }
+        }
+    }
+
+    /// True when any cell editor currently has keyboard focus.
+    fn any_editor_focused(&self, ctx: &egui::Context) -> bool {
+        self.notebook.cells.iter().any(|cell| {
+            ctx.memory(|memory| {
+                memory.has_focus(egui::Id::new(("sagenote-cell-editor", cell.id.0)))
+            })
+        })
+    }
+
+    /// True when a modal dialog is open (shortcuts are suppressed).
+    fn any_modal_open(&self) -> bool {
+        self.error_dialog.is_some()
+            || self.show_unsaved
+            || self.about_open
+            || self.settings_open
+            || self.shortcuts_open
+            || self.recording.is_some()
+    }
+
+    /// Consume a single-press binding from this frame's input.
+    fn consume_binding(&self, ctx: &egui::Context, binding: &str) -> bool {
+        let Some(presses) = crate::settings::parse_binding(binding) else {
+            return false;
+        };
+        let Some(press) = presses.first() else {
+            return false;
+        };
+        ctx.input_mut(|i| i.consume_key(press.modifiers, press.key))
+    }
+
+    /// Feed a sequence binding (e.g. `"d d"`): the first press arms the
+    /// sequence, the second press within [`SEQUENCE_TIMEOUT`] fires it.
+    fn consume_sequence(&mut self, ctx: &egui::Context, binding: &str) -> bool {
+        let Some(presses) = crate::settings::parse_binding(binding) else {
+            return false;
+        };
+        // A double-press binding (`"d d"`) fires on the second press;
+        // anything else behaves as a single-press binding.
+        let double = presses.len() == 2 && presses[0] == presses[1];
+        if !double {
+            return self.consume_binding(ctx, binding);
+        }
+        let first = presses[0];
+        if !ctx.input_mut(|i| i.consume_key(first.modifiers, first.key)) {
+            return false;
+        }
+        match self.sequence_pending.take() {
+            // Second press of the same key within the timeout: the binding fires.
+            Some((key, at)) if key == first.key && at.elapsed() < SEQUENCE_TIMEOUT => true,
+            // First press (or a stale/different pending): arm the sequence.
+            _ => {
+                self.sequence_pending = Some((first.key, Instant::now()));
+                false
+            }
         }
     }
 
@@ -1452,6 +2062,12 @@ impl App {
             UiAction::MoveUp(id) => self.move_cell(id, true),
             UiAction::MoveDown(id) => self.move_cell(id, false),
             UiAction::Run(id) => self.run_cell(id),
+            UiAction::RunAndAdvance(id) => self.run_and_advance(id),
+            UiAction::RunAndInsertBelow(id) => self.run_and_insert_below(id),
+            UiAction::ToCommandMode(id) => {
+                // The editor surrendered focus (ui::draw_cell); select it.
+                self.selected_cell = Some(id);
+            }
             UiAction::RunAll => self.run_all(),
             UiAction::RunAbove(id) => self.run_above(id),
             UiAction::Interrupt => self.interrupt(),
@@ -1465,7 +2081,20 @@ impl App {
             }
             UiAction::ToggleInspector => self.toggle_inspector(),
             UiAction::RefreshInspector => self.request_inspector(),
+            UiAction::RequestCompletion {
+                cell,
+                source,
+                offset,
+                start,
+            } => self.request_completion(cell, source, offset, start),
+            UiAction::RequestDocs {
+                cell,
+                source,
+                offset,
+            } => self.request_docs(cell, source, offset),
             UiAction::ShowAbout => self.about_open = true,
+            UiAction::ShowSettings => self.settings_open = true,
+            UiAction::ShowShortcuts => self.shortcuts_open = true,
         }
     }
 
@@ -1490,20 +2119,18 @@ impl App {
             });
             ui.add_space(4.0);
         } else if !self.backend_alive {
+            let p = CarbonPalette::of(ui);
             egui::Frame::default()
-                .fill(egui::Color32::from_rgb(255, 243, 235))
-                .stroke(egui::Stroke::new(
-                    1.0_f32,
-                    egui::Color32::from_rgb(240, 190, 160),
-                ))
-                .corner_radius(6.0)
-                .inner_margin(8.0)
+                .fill(p.danger_bg)
+                .stroke(egui::Stroke::new(1.0_f32, p.danger))
+                .corner_radius(0.0)
+                .inner_margin(12.0)
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
                             egui::RichText::new("Sage is not running.")
                                 .strong()
-                                .color(egui::Color32::from_rgb(160, 50, 30)),
+                                .color(p.danger),
                         );
                         if ui.button("Retry").clicked() {
                             self.retry_backend(ctx);
@@ -1595,7 +2222,7 @@ impl App {
             ui.label(format!("sagenote — version {}", env!("CARGO_PKG_VERSION")));
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new("Shift+Enter run  ·  Ctrl/⌘ I variables  ·  Ctrl/⌘ S save")
+                egui::RichText::new("Shift+Enter run  ·  Ctrl/Cmd I variables  ·  Ctrl/Cmd S save")
                     .small()
                     .weak(),
             );
@@ -1608,9 +2235,326 @@ impl App {
             self.about_open = false;
         }
     }
+
+    fn draw_settings_modal(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut close = false;
+        let mut changed = false;
+
+        // Shortcut recorder: capture key presses before the dialog's widgets
+        // can see them.  Escape cancels; enough presses complete the binding.
+        let mut completed: Option<(&'static str, Vec<KeyPress>)> = None;
+        let mut cancelled = false;
+        if let Some(recording) = &mut self.recording {
+            let mut fresh: Vec<KeyPress> = Vec::new();
+            ctx.input(|i| {
+                for event in &i.events {
+                    if let egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } = event
+                    {
+                        fresh.push(KeyPress {
+                            key: *key,
+                            modifiers: *modifiers,
+                        });
+                    }
+                }
+            });
+            for press in fresh {
+                // Consume the captured key so sliders and buttons in this
+                // dialog do not also react to it.
+                ctx.input_mut(|i| i.consume_key(press.modifiers, press.key));
+                if press.key == egui::Key::Escape {
+                    cancelled = true;
+                    break;
+                }
+                recording.presses.push(press);
+                if recording.presses.len() >= recording.expected {
+                    completed = Some((recording.action, recording.presses.clone()));
+                    break;
+                }
+            }
+        }
+        if cancelled || completed.is_some() {
+            self.recording = None;
+        }
+        if let Some((action, presses)) = completed {
+            let value = format_binding(&presses);
+            self.settings.keybindings.set(action, value);
+            changed = true;
+        }
+
+        egui::Modal::new(egui::Id::new("sagenote-settings-modal")).show(ctx, |ui| {
+            ui.set_min_width(540.0);
+            ui.heading("Settings");
+            ui.add_space(6.0);
+
+            ui.strong("Appearance");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Theme:");
+                let r = ui.radio_value(&mut self.settings.theme, ThemeMode::System, "System");
+                changed |= r.changed();
+                let r = ui.radio_value(&mut self.settings.theme, ThemeMode::Light, "Light");
+                changed |= r.changed();
+                let r = ui.radio_value(&mut self.settings.theme, ThemeMode::Dark, "Dark");
+                changed |= r.changed();
+            });
+            let r = ui.add(
+                egui::Slider::new(&mut self.settings.ui_font_size, 12.0..=24.0)
+                    .text("UI font size (pt)"),
+            );
+            changed |= r.changed();
+            let r = ui.add(
+                egui::Slider::new(&mut self.settings.code_font_size, 10.0..=22.0)
+                    .text("Code font size (pt)"),
+            );
+            changed |= r.changed();
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.strong("Keyboard shortcuts");
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .id_salt("sagenote-settings-bindings")
+                .max_height(320.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    egui::Grid::new("sagenote-settings-bindings-grid")
+                        .num_columns(4)
+                        .striped(true)
+                        .min_row_height(24.0)
+                        .show(ui, |ui| {
+                            for meta in BINDING_META {
+                                let binding = self.settings.keybindings.get(meta.id).to_owned();
+                                ui.label(meta.label);
+                                ui.monospace(binding_display(&binding));
+                                let is_recording = self
+                                    .recording
+                                    .as_ref()
+                                    .is_some_and(|rec| rec.action == meta.id);
+                                let label = if is_recording {
+                                    "Press keys\u{2026}"
+                                } else {
+                                    "Change"
+                                };
+                                let button = egui::Button::new(label).small();
+                                let response = if is_recording {
+                                    ui.add_enabled(false, button)
+                                } else {
+                                    ui.add(button)
+                                };
+                                if response.clicked() {
+                                    let expected = parse_binding(default_binding(meta.id))
+                                        .map(|presses| presses.len())
+                                        .unwrap_or(1);
+                                    self.recording = Some(Recording {
+                                        action: meta.id,
+                                        presses: Vec::new(),
+                                        expected,
+                                    });
+                                }
+                                let clear = ui.add_enabled(
+                                    !is_recording && !binding.is_empty(),
+                                    egui::Button::new("Clear").small(),
+                                );
+                                if clear.clicked() {
+                                    self.settings.keybindings.set(meta.id, "");
+                                    changed = true;
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Reset shortcuts to Jupyter defaults").clicked() {
+                    self.settings.keybindings = Keybindings::jupyter();
+                    changed = true;
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Shortcuts follow Jupyter: Esc enters command mode, then \
+                         B/A insert cells, D D deletes, Z undoes, X/C/V \
+                         cut/copy/paste. Enter returns to the editor.",
+                )
+                .small()
+                .weak(),
+            );
+
+            ui.add_space(10.0);
+            if ui.button("Close").clicked() {
+                close = true;
+            }
+            // Escape closes the dialog when not recording.
+            if self.recording.is_none()
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                close = true;
+            }
+        });
+        if close {
+            self.settings_open = false;
+            self.recording = None;
+        }
+        if changed {
+            crate::settings::apply_with_palette(&self.settings, ctx);
+            if let Err(error) = crate::settings::save_settings(&self.settings) {
+                self.push_log(format!("could not save settings: {error:#}"));
+            }
+        }
+    }
+
+    fn draw_docs_window(&mut self, ctx: &egui::Context) {
+        let Some(doc) = self.doc_popup.clone() else {
+            return;
+        };
+        let p = if ctx.theme() == egui::Theme::Dark {
+            CarbonPalette::dark()
+        } else {
+            CarbonPalette::light()
+        };
+        let mut close = false;
+        let title = if doc.name.is_empty() {
+            "Documentation".to_owned()
+        } else {
+            doc.name.clone()
+        };
+        egui::Window::new("Documentation")
+            .id(egui::Id::new("sagenote-docs"))
+            .default_width(560.0)
+            .default_height(380.0)
+            .resizable(true)
+            .collapsible(false)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(p.bg)
+                    .stroke(egui::Stroke::new(1.0_f32, p.border_subtle))
+                    .corner_radius(0.0),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(&title)
+                            .font(ui::semibold(16.0))
+                            .color(p.text_primary),
+                    );
+                    if !doc.type_name.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&doc.type_name)
+                                .small()
+                                .color(p.text_helper),
+                        );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Close documentation")
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+                if !doc.signature.is_empty() {
+                    ui.add_space(4.0);
+                    egui::Frame::default()
+                        .fill(p.layer)
+                        .corner_radius(0.0)
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&doc.signature)
+                                        .monospace()
+                                        .color(p.text_secondary),
+                                )
+                                .wrap(),
+                            );
+                        });
+                }
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("sagenote-docs-body")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        draw_doc_text(ui, &doc.text, &p);
+                    });
+            });
+        if close {
+            self.doc_popup = None;
+        }
+    }
+
+    fn draw_shortcuts_modal(&mut self, ctx: &egui::Context) {
+        if !self.shortcuts_open {
+            return;
+        }
+        let mut close = false;
+        egui::Modal::new(egui::Id::new("sagenote-shortcuts-modal")).show(ctx, |ui| {
+            ui.set_min_width(560.0);
+            ui.heading("Keyboard shortcuts");
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Two modes, as in Jupyter: command mode (no cell focused) and \
+                         edit mode (typing in a cell). `Esc` switches to command mode, \
+                         `Enter` enters the editor.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .id_salt("sagenote-shortcuts-list")
+                .max_height(420.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    let mut last_group = "";
+                    for meta in BINDING_META {
+                        if meta.group != last_group {
+                            ui.add_space(6.0);
+                            ui.strong(meta.group);
+                            last_group = meta.group;
+                        }
+                        let binding = self.settings.keybindings.get(meta.id);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(binding_display(binding))
+                                    .monospace()
+                                    .strong(),
+                            );
+                            ui.label(meta.label);
+                        });
+                    }
+                });
+            ui.add_space(10.0);
+            if ui.button("Close").clicked() {
+                close = true;
+            }
+        });
+        if close {
+            self.shortcuts_open = false;
+        }
+    }
 }
 
 impl eframe::App for App {
+    /// Match the window clear colour to the Carbon panel fill.  eframe's
+    /// default is near-black, which showed through anywhere a panel did not
+    /// cover (and behind the transparent central panel) even in light mode.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_startup(ctx);
         self.drain_events();
@@ -1635,6 +2579,13 @@ impl eframe::App for App {
             can_refresh_inspector: backend_ready && !running && self.introspect_in_flight.is_none(),
         };
         let mut actions = ui::menu_bar(ctx, &menu_state);
+        actions.extend(ui::toolbar(
+            ctx,
+            &ToolbarState {
+                backend_ready: menu_state.backend_ready,
+                running: menu_state.running,
+            },
+        ));
 
         let status_state = StatusState {
             starting: self.starting,
@@ -1651,11 +2602,7 @@ impl eframe::App for App {
         self.draw_inspector(ctx, backend_ready, running);
 
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::default()
-                    .fill(egui::Color32::from_gray(250))
-                    .inner_margin(egui::Margin::same(12)),
-            )
+            .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(12)))
             .show(ctx, |ui| {
                 self.draw_startup_banner(ui, ctx);
                 let changed = egui::ScrollArea::vertical()
@@ -1673,6 +2620,9 @@ impl eframe::App for App {
                                 syntax: &self.syntax,
                                 renderer: &mut self.renderer,
                                 actions: &mut actions,
+                                selected: self.selected_cell,
+                                bindings: &self.settings.keybindings,
+                                scroll_to_cell: &mut self.scroll_to_cell,
                             },
                         )
                     })
@@ -1681,7 +2631,7 @@ impl eframe::App for App {
                     self.notebook.dirty = true;
                 }
                 ui.add_space(8.0);
-                if ui.button("＋ Add cell").clicked() {
+                if ui.button("+ Add cell").clicked() {
                     actions.push(UiAction::AddCell(None));
                 }
                 if !self.log.is_empty() {
@@ -1702,16 +2652,20 @@ impl eframe::App for App {
         for action in actions {
             self.handle_action(action, ctx);
         }
+        self.draw_docs_window(ctx);
         if self.error_dialog.is_none() {
             self.draw_unsaved_modal(ctx);
             self.draw_about_modal(ctx);
+            self.draw_settings_modal(ctx);
+            self.draw_shortcuts_modal(ctx);
         }
         self.update_title(ctx);
 
         if self.starting || self.any_running() {
             ctx.request_repaint_after(Duration::from_millis(100));
         } else if self.show_inspector && backend_ready {
-            ctx.request_repaint_after(Duration::from_millis(500));
+            let interval = Duration::from_secs(self.settings.inspector_refresh_secs.max(1));
+            ctx.request_repaint_after(interval);
         }
     }
 }
@@ -1748,6 +2702,88 @@ impl Drop for App {
 
 const LOG_LIMIT: usize = 32 * 1024;
 
+/// Render a plain docstring with light IDE-style formatting: RST section
+/// headings become semi-bold labels, indented/`>>>` blocks are monospaced on a
+/// Gray 10 code surface, and prose is wrapped normally.
+fn draw_doc_text(ui: &mut egui::Ui, text: &str, p: &CarbonPalette) {
+    let text = crate::text::strip_ansi(text);
+    if text.trim().is_empty() {
+        ui.label(egui::RichText::new("No documentation.").color(p.text_helper));
+        return;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let is_code = |line: &str| {
+        line.starts_with("    ")
+            || line.starts_with('\t')
+            || line.trim_start().starts_with(">>>")
+            || line.trim_start().starts_with("...")
+    };
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        // RST section heading: prose followed by a line of punctuation.
+        if i + 1 < lines.len() && !line.trim().is_empty() {
+            let underline = lines[i + 1].trim();
+            if underline.len() >= 3
+                && underline
+                    .chars()
+                    .all(|ch| matches!(ch, '-' | '=' | '~' | '^' | '"'))
+            {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(line.trim())
+                        .font(ui::semibold(14.0))
+                        .color(p.text_primary),
+                );
+                i += 2;
+                continue;
+            }
+        }
+        if line.trim().is_empty() {
+            ui.add_space(4.0);
+            i += 1;
+            continue;
+        }
+        if is_code(line) {
+            let mut block = String::new();
+            while i < lines.len() && (is_code(lines[i]) || lines[i].trim().is_empty()) {
+                block.push_str(lines[i].trim_end());
+                block.push('\n');
+                i += 1;
+            }
+            egui::Frame::default()
+                .fill(p.layer)
+                .corner_radius(0.0)
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(block.trim_end())
+                                .monospace()
+                                .color(p.text_secondary),
+                        )
+                        .wrap(),
+                    );
+                });
+        } else {
+            let mut block = String::new();
+            while i < lines.len() && !lines[i].trim().is_empty() && !is_code(lines[i]) {
+                block.push_str(lines[i].trim_end());
+                block.push('\n');
+                i += 1;
+            }
+            ui.add(
+                egui::Label::new(egui::RichText::new(block.trim_end()).color(p.text_primary))
+                    .wrap(),
+            );
+        }
+    }
+}
+
+/// How long the first key of a sequence binding (`D D`) stays armed.
+const SEQUENCE_TIMEOUT: Duration = Duration::from_secs(1);
+
 fn append_log(log: &mut String, line: &str) {
     if !log.is_empty() && !log.ends_with('\n') {
         log.push('\n');
@@ -1777,29 +2813,6 @@ fn with_sagenote_extension(path: PathBuf) -> PathBuf {
             path.with_file_name(name)
         }
     }
-}
-
-fn configure_style(ctx: &egui::Context) {
-    ctx.set_theme(egui::Theme::Light);
-    let mut style = (*ctx.style()).clone();
-    style.visuals = egui::Visuals::light();
-    style.visuals.panel_fill = egui::Color32::from_gray(250);
-    style.visuals.window_fill = egui::Color32::from_gray(252);
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(8.0, 4.0);
-    style
-        .text_styles
-        .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
-    style
-        .text_styles
-        .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
-    style
-        .text_styles
-        .insert(egui::TextStyle::Monospace, egui::FontId::monospace(13.5));
-    style
-        .text_styles
-        .insert(egui::TextStyle::Heading, egui::FontId::proportional(20.0));
-    ctx.set_style(style);
 }
 
 /// Unit-testable helpers live in the binary crate; they need no GUI context.
@@ -1890,6 +2903,29 @@ mod tests {
             with_sagenote_extension(PathBuf::from("/tmp/a.txt")),
             PathBuf::from("/tmp/a.txt.sagenote")
         );
+    }
+
+    #[test]
+    fn doc_text_renders_headless() {
+        let ctx = egui::Context::default();
+        crate::settings::install_fonts(&ctx);
+        let p = crate::settings::CarbonPalette::light();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                draw_doc_text(
+                    ui,
+                    "plot(x)\n=======\n\nPlot a function.\n\n    plot(sin(x))\n    plot(cos(x))\n",
+                    &p,
+                );
+            });
+        });
     }
 
     #[test]

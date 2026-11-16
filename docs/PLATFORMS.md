@@ -15,7 +15,8 @@ Divergences live in `platform.rs` with `cfg`, not a `trait Platform`:
   be omitted if xdg-portal is used. rfd's Linux **message** dialog is implemented
   through `zenity`; native error dialogs require it (the in-window banner is the
   fallback).
-- shortcut modifiers: `Modifiers::COMMAND` everywhere, no branching.
+- shortcut modifiers: `Modifiers::COMMAND` for global bindings and
+  Shift/Ctrl/Alt for editor bindings (run/complete); no platform branching.
 - `cargo-bundle` `Info.plist` must set `NSHighResolutionCapable` to `YES`, or
   the whole UI renders at 1× while the terminal binary looks fine.
 - wgpu resolves to Metal on M1. Confirm once with `RUST_LOG=wgpu=info`; no
@@ -23,7 +24,9 @@ Divergences live in `platform.rs` with `cfg`, not a `trait Platform`:
 - Math rendering uses `fontdb` system fonts for SVG text (matplotlib labels)
   and for CJK/emoji glyphs absent from KaTeX. A minimal Linux install needs
   DejaVu/Noto fonts for labels; if no face has a CJK outline the formula falls
-  back to source. `RATEX_UNICODE_FONT` is loaded into the same database when set.
+  back to source. `RATEX_UNICODE_FONT` is loaded into the same database when
+  set.  The UI itself embeds IBM Plex Sans/Mono (`assets/fonts/`), so the
+  chrome does not depend on installed system fonts.
 
 ## Linux (Debian/Ubuntu)
 

@@ -6,6 +6,7 @@
 
 mod app;
 mod render;
+mod settings;
 mod text;
 mod ui;
 

@@ -244,7 +244,7 @@ fn queued_cell_is_dropped_on_interrupt() {
 }
 
 #[test]
-fn introspection_and_empty_completion_hooks() {
+fn introspection_and_completion() {
     let mut backend = backend(Duration::from_secs(2));
     let rx = backend.events();
     let request = IntrospectId(1);
@@ -261,13 +261,42 @@ fn introspection_and_empty_completion_hooks() {
     )));
 
     let cell = CellId::new();
-    backend.completion(cell, 3).unwrap();
+    backend.completion(cell, "pri", 3).unwrap();
     let events = collect_until(&rx, Duration::from_secs(5), |events| {
-        events
-            .iter()
-            .any(|e| matches!(e, BackendEvent::Completion { cell: c, offset: 3, items } if *c == cell && items.is_empty()))
+        events.iter().any(|e| {
+            matches!(
+                e,
+                BackendEvent::Completion { cell: c, offset: 3, items }
+                    if *c == cell && items.iter().any(|item| item == "print(")
+            )
+        })
     });
-    assert!(!events.is_empty());
+    assert!(events.iter().any(|e| matches!(
+        e,
+        BackendEvent::Completion { items, .. } if items.len() >= 2
+    )));
+}
+
+#[test]
+fn documentation_is_forwarded_as_a_frame() {
+    let mut backend = backend(Duration::from_secs(2));
+    let rx = backend.events();
+    let cell = CellId::new();
+    backend.docs(cell, "pri", 3).unwrap();
+    let events = collect_until(&rx, Duration::from_secs(5), |events| {
+        events.iter().any(|e| {
+            matches!(
+                e,
+                BackendEvent::Frame(Frame::Doc { id, offset: 3, name, .. })
+                    if *id == cell && name == "pri"
+            )
+        })
+    });
+    assert!(events.iter().any(|e| matches!(
+        e,
+        BackendEvent::Frame(Frame::Doc { text, signature, .. })
+            if text.contains("Print") && signature.contains("print")
+    )));
 }
 
 #[test]

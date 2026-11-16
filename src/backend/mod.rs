@@ -147,7 +147,9 @@ pub enum BackendEvent {
     },
     /// A fresh process finished the ready handshake and the preamble.
     Restarted { sage_version: String },
-    /// Placeholder completion channel. Emits an empty vector.
+    /// Completion candidates for the token at `offset` in `source`.
+    /// `items` is empty when nothing matches (and always for the placeholder
+    /// path); the UI inserts a single item directly or shows a popup.
     Completion {
         cell: CellId,
         offset: usize,
@@ -175,7 +177,12 @@ pub trait EvalBackend {
     fn eval(&mut self, cell: CellId, run: RunId, source: &str) -> Result<()>;
     fn interrupt(&mut self, scope: InterruptScope) -> Result<()>;
     fn introspect(&mut self, req: IntrospectId) -> Result<()>;
-    fn completion(&mut self, cell: CellId, offset: usize) -> Result<()>;
+    /// Prefix/attribute completion for the token ending at `offset`
+    /// (characters).  Results arrive as [`BackendEvent::Completion`].
+    fn completion(&mut self, cell: CellId, source: &str, offset: usize) -> Result<()>;
+    /// Documentation for the name ending at `offset` (characters).  The answer
+    /// is a `Frame::Doc`, forwarded to the UI.
+    fn docs(&mut self, cell: CellId, source: &str, offset: usize) -> Result<()>;
     fn declared_mimetypes(&self) -> &[MimeType];
     fn events(&self) -> mpsc::Receiver<BackendEvent>;
 }

@@ -169,6 +169,12 @@ enum Command {
     Completion {
         cell: CellId,
         offset: usize,
+        source: String,
+    },
+    Docs {
+        cell: CellId,
+        offset: usize,
+        source: String,
     },
     Shutdown {
         done: Sender<()>,
@@ -358,11 +364,23 @@ impl EvalBackend for StdioDriverBackend {
             .map_err(|_| anyhow!("supervisor thread is not running"))
     }
 
-    fn completion(&mut self, cell: CellId, offset: usize) -> Result<()> {
-        // Scope boundary: LSP/real completion is not implemented.  The event
-        // exists so the UI can already display an empty popup gracefully.
+    fn completion(&mut self, cell: CellId, source: &str, offset: usize) -> Result<()> {
         self.cmd_tx
-            .send(Command::Completion { cell, offset })
+            .send(Command::Completion {
+                cell,
+                offset,
+                source: source.to_owned(),
+            })
+            .map_err(|_| anyhow!("supervisor thread is not running"))
+    }
+
+    fn docs(&mut self, cell: CellId, source: &str, offset: usize) -> Result<()> {
+        self.cmd_tx
+            .send(Command::Docs {
+                cell,
+                offset,
+                source: source.to_owned(),
+            })
             .map_err(|_| anyhow!("supervisor thread is not running"))
     }
 
@@ -497,12 +515,50 @@ impl Supervisor {
                     });
                 }
             }
-            Command::Completion { cell, offset } => {
-                self.emit(BackendEvent::Completion {
-                    cell,
+            Command::Completion {
+                cell,
+                offset,
+                source,
+            } => {
+                if let Err(error) = self.write_request(&DriverRequest::Complete {
+                    id: cell,
                     offset,
-                    items: Vec::new(),
-                });
+                    source: &source,
+                }) {
+                    // Completion is advisory: keep the session and answer with
+                    // an empty list so the UI does not wait forever.
+                    self.emit(BackendEvent::ProtocolWarning {
+                        message: format!("completion request failed: {error:#}"),
+                    });
+                    self.emit(BackendEvent::Completion {
+                        cell,
+                        offset,
+                        items: Vec::new(),
+                    });
+                }
+            }
+            Command::Docs {
+                cell,
+                offset,
+                source,
+            } => {
+                if let Err(error) = self.write_request(&DriverRequest::Doc {
+                    id: cell,
+                    offset,
+                    source: &source,
+                }) {
+                    self.emit(BackendEvent::ProtocolWarning {
+                        message: format!("documentation request failed: {error:#}"),
+                    });
+                    self.emit(BackendEvent::Frame(Frame::Doc {
+                        id: cell,
+                        offset,
+                        name: String::new(),
+                        type_name: String::new(),
+                        signature: String::new(),
+                        text: format!("Could not request documentation: {error:#}"),
+                    }));
+                }
             }
             Command::Shutdown { done } => {
                 self.shutting_down = true;
@@ -633,6 +689,15 @@ impl Supervisor {
                         // Keep the in-flight entry until `end`; the driver
                         // guarantees an end even for KeyboardInterrupt.
                         self.emit(BackendEvent::Frame(frame));
+                    }
+                    Frame::Complete { id, offset, items } => {
+                        // Completion is not cell output: expose it as the
+                        // dedicated event so the UI can route it by cell id.
+                        self.emit(BackendEvent::Completion {
+                            cell: *id,
+                            offset: *offset,
+                            items: items.clone(),
+                        });
                     }
                     _ => self.emit(BackendEvent::Frame(frame)),
                 }

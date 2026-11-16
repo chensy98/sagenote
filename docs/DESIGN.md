@@ -8,6 +8,9 @@ this file disagree, fix one deliberately — do not let them drift.
 
 * Every pixel is egui/eframe; every calculation is an external `sage` spawned
   at runtime. No WebView, no JavaScript, no WASM frontend, no bundled Sage.
+* The UI follows the IBM Carbon palette in `src/settings.rs` (light by default,
+  Carbon dark when the theme is Dark/System-dark): square corners, 8 px grid,
+  hairline borders, Blue 60 focus.  Do not reintroduce ad-hoc greys in `ui.rs`.
 * `src/backend/` and `src/cells.rs` import no `eframe`, no `egui`, no windowing
   type. CI can therefore run them headless.
 * Frames are typed by `type`, not parsed out of user text. Output kinds are
@@ -31,6 +34,8 @@ this file disagree, fix one deliberately — do not let them drift.
 
 ## Scope boundaries
 
-No LSP/real autocompletion (trait + empty event only), no 3D/HTML rendering
-(placeholder), no Windows, no Jupyter kernel backend, no ipynb round-trip, no
-bundled Sage. The seams are named above; leave them.
+No LSP/server-backed autocompletion (Tab completion is driver-side prefix and
+attribute completion only; Ctrl+Space docs is `inspect.getdoc`, not a help
+server), no 3D/HTML rendering (placeholder), no Windows, no Jupyter kernel
+backend, no ipynb round-trip, no bundled Sage. The seams are named above;
+leave them.
