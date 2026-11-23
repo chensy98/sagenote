@@ -522,7 +522,7 @@ impl Runner {
 
     fn request_docs(&mut self) {
         let cell = CellId::new();
-        if let Err(err) = self.backend.docs(cell, "plot", 4) {
+        if let Err(err) = self.backend.docs(cell, "plot", 4, Some("plot")) {
             eprintln!("sadrive: docs request failed: {err:#}");
             return;
         }
@@ -604,7 +604,12 @@ fn print_frame(frame: &Frame, current: Option<(CellId, RunId)>) {
         Frame::Complete { id, offset, items } => {
             println!("complete cell={id} offset={offset} ({} items)", items.len());
             for item in items {
-                println!("  {item}");
+                let sig = if item.signature.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", item.signature)
+                };
+                println!("  {}{} [{:?}]", item.name, sig, item.kind);
             }
         }
         Frame::Doc {

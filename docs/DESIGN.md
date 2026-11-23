@@ -39,3 +39,10 @@ attribute completion only; Ctrl+Space docs is `inspect.getdoc`, not a help
 server), no 3D/HTML rendering (placeholder), no Windows, no Jupyter kernel
 backend, no ipynb round-trip, no bundled Sage. The seams are named above;
 leave them.
+
+Official Sage is the sole Python-side dependency: the driver uses only the
+Python standard library and Sage's own preparser, and nothing may require
+installing extra packages into the user's Sage environment. The live Sage
+namespace is the only source of completion and documentation; static analysis
+(LSP over stubs) cannot see session state and is excluded as policy, not
+deferred — revisit only if official Sage ever ships a language server itself.

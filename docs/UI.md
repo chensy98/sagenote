@@ -39,23 +39,48 @@ to Idle while interrupted cells keep that badge.
 
 ## Workspace
 
+Cells are VSCode-Jupyter-shaped: **no box**. Each cell is a 20 px strip above
+the editor plus a `[n]` execution-count gutter (44 px) left of the code.
+A 2 px Carbon Blue 60 accent on the left marks the selected/running cell.
+The strip hosts the small floating toolbar (Run, +, ↑, ↓, ×) — only while the
+cell is selected — so an unselected notebook is nothing but gutter, code and
+outputs. `[*]` is queued/running, `[–]` interrupted, `[n]` in the danger
+colour for a failed run, and grey when the shown outputs are stale.
+
 Run / insert below / move up / move down / delete per cell, plus a bottom add;
 menus and quick buttons for Run All / Run Above / Interrupt. Run All/Above
 skip empty cells. The supervisor queues at most one active cell, and the UI
-shows queued ones. Outputs are Gray 10 with a hairline border; cells are
-separated by spacing and a square 1 px border, not by coloured pills.
-Text/stderr/tracebacks and the math/SVG/PNG pipeline share the panel; HTML/3D
-are explicit scope-limit placeholders.
+shows queued ones. Outputs are Gray 10 with a hairline border. Text/stderr/
+tracebacks and the math/SVG/PNG pipeline share the panel; HTML/3D are explicit
+scope-limit placeholders. Rendered outputs carry no mime tag — the transport
+mimetype is protocol plumbing — a label appears only for a mimetype this
+client cannot render, where it says what the raw payload is.
+
+## Auto-pairs
+
+Typing an opener inserts the pair and leaves the caret between; typing a
+closer over the same closer skips over it; Backspace between an empty pair
+deletes both; a selection is wrapped. Quotes pair only when the previous
+character is not a word character, so apostrophes inside words stay plain.
+The decision runs on pure functions (`auto_pair_on_text`,
+`auto_pair_on_backspace`) before the editor is laid out, reusing the
+completion machinery for the caret move. Settings has an "Auto-close brackets
+and quotes" checkbox (default on).
 
 ## Files and shortcuts
 
 New/Open/Save/Save As via rfd (xdg-portal/Wayland on Linux, AppKit on macOS).
-Atomic save; title bar `sagenote — name *` while dirty. Window close, menu
+Atomic save; title bar `sagenote — name *` while dirty — the native window
+title carries the branding, so the in-window menu bar starts directly with
+**File**. Window close, menu
 Quit, ⌘/Ctrl+Q and ⌘/Ctrl+W all funnel through one unsaved-changes modal
 (Save/Discard/Cancel). Global shortcuts use `Modifiers::COMMAND`:
 N/O/S/Shift+S; `.` interrupt; I inspector. Editor bindings are Shift+Enter
-(run), Tab (complete), Ctrl+Space (docs), Ctrl+Enter (run in place), Alt+Enter
-(run and insert below), and Ctrl+N/Ctrl+P (next/previous completion candidate).
+(run, then **focus the next cell's editor** — a new cell is appended when the
+run cell is the last, so repeated Shift+Enter trails the notebook), Tab
+(complete), Ctrl+Space (docs; over an open popup it toggles docs-follow),
+Ctrl+Enter (run in place), Alt+Enter (run, insert and focus below), and
+Ctrl+N/Ctrl+P (next/previous completion candidate).
 Cmd+Q/Cmd+W are intercepted because egui does not provide them; otherwise
 macOS could not quit from the keyboard.  Settings → Settings… lists every
 remappable binding; **Change** records a new one and **Clear** disables it
@@ -97,16 +122,30 @@ dialog reports the version and the shortcut set.
 
 Pressing **Tab** in a focused editor completes the dotted identifier ending at
 the caret. A single candidate is inserted directly; several candidates open a
-compact Carbon popup below the caret (22 px rows, 13 px monospace). **Up/Down**
-or the configurable **Ctrl+N / Ctrl+P** bindings move the selection,
-Enter/Tab accept, Esc closes, and a click accepts the clicked row. Any text
-change closes the popup, and the next Tab asks the driver again.
+compact Carbon popup (22 px rows, 13 px monospace) whose **left edge sits at
+the start of the completed token**, so the list stays put while typing.
+**Up/Down** or the configurable **Ctrl+N / Ctrl+P** bindings move the
+selection, Enter/Tab accept, Esc closes, and a click accepts the clicked row.
+Any text change closes the popup, and the next Tab asks the driver again.
 
 Candidates come from the live driver namespace (`rlcompleter`): user variables,
-Sage globals, keywords, Python builtins and attributes, with `(` appended to
-callables. The token may contain `.` so `a.bi` is replaced by `a.bit_length`
-as a whole. The driver hides driver internals, dunders (unless the token starts
-with `_`), and `DisplayManager` objects such as the `dm` from `init.sage`.
+Sage globals, keywords, Python builtins and attributes. Each candidate carries
+a **kind** — `function`, `class`, `module`, `variable`, `keyword` — probed in
+the live namespace under a 0.5 s budget; unprobed candidates report `unknown`.
+The popup draws a 12 px colour-coded icon column so the names left-align, and
+candidate names are clean (no rlcompleter `(` suffix): the kind is the callable
+signal, so accepting a function or class with auto-close on inserts `name()`
+with the caret between the parentheses. The token may contain `.` so `a.bi` is
+replaced by `a.bit_length` as a whole. The driver hides driver internals,
+dunders (unless the token starts with `_`), and `DisplayManager` objects such
+as the `dm` from `init.sage`.
+
+Callables also carry their **signature** — the argument list, parens included —
+rendered on the same line as the name in a dimmer colour: `print(value, …,
+sep=' ', end='\n')`. Long signatures are truncated with an ellipsis so the row
+fits the popup's 480 px cap; the row's hover text shows the full list. The
+signature is probed in the live namespace alongside the kind, under the same
+0.5 s budget, and is empty when it cannot be produced.
 
 Because the driver is single-threaded, completion is suppressed while a cell is
 queued/running. A response is applied only if the cell source is exactly the
@@ -118,12 +157,20 @@ deferred so Ctrl+N cannot trigger New Notebook before it moves the selection.
 
 ## Documentation
 
-**Ctrl+Space** (configurable, and clearable in Settings) asks the driver for the
-docstring of the dotted name ending at the caret. The driver resolves the name
-and returns `inspect.getdoc` plus the type and signature; the UI opens a
-non-modal, resizable **Documentation** window with a signature block, RST-style
-section headings, wrapped prose and monospaced code blocks. Escape or the ×
-button closes it. No HTML/WebView is involved.
+**Ctrl+Space** (configurable, and clearable in Settings) asks the driver for a
+docstring. The UI resolves the target around the caret first — the dotted
+identifier ending there, or the innermost **enclosing call's callee** when the
+caret sits inside an argument list — and sends it as an explicit `name`; when
+nothing is identifiable the driver falls back to its own token extraction.
+The driver resolves the name and returns `inspect.getdoc` plus the type and
+signature; the UI opens a non-modal, resizable **Documentation** window with a
+signature block, RST-style section headings, wrapped prose and monospaced code
+blocks. Escape or the × button closes it. No HTML/WebView is involved.
+
+**Ctrl+Space over an open completion popup toggles docs-follow mode**: the
+selected candidate's documentation renders in a panel anchored to the right of
+the candidate list, and the panel follows the selection. Closing the popup
+(accept, Esc, source change) drops the panel with it.
 
 Docs are suppressed while a cell is queued/running and share the completion
 source guard: an answer is ignored if the cell changed after the request. A

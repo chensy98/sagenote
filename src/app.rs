@@ -13,8 +13,9 @@ use crossbeam_channel::{bounded, Receiver, TryRecvError};
 use eframe::egui::{self, ViewportCommand};
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use sagenote::backend::{
-    BackendEvent, CellId, DisplayMode, DriverConfig, EvalBackend, Frame, InterruptScope,
-    IntrospectId, MimeBundle, RunId, StdioDriverBackend, StreamName, VarInfo, WakeCallback,
+    BackendEvent, CellId, CompletionItem, DisplayMode, DriverConfig, EvalBackend, Frame,
+    InterruptScope, IntrospectId, MimeBundle, RunId, StdioDriverBackend, StreamName, VarInfo,
+    WakeCallback,
 };
 use sagenote::cells::{Cell, CellState, Notebook, SavedOutput};
 use sagenote::platform::{self, DiscoveryError, DiscoveryFailure, DiscoverySource, SageInstall};
@@ -25,7 +26,9 @@ use crate::settings::{
     binding_display, default_binding, format_binding, parse_binding, CarbonPalette, KeyPress,
     Keybindings, Settings, ThemeMode, BINDING_META,
 };
-use crate::ui::{self, MenuState, NotebookUi, StatusState, SyntaxAssets, ToolbarState, UiAction};
+use crate::ui::{
+    self, draw_doc_text, MenuState, NotebookUi, StatusState, SyntaxAssets, ToolbarState, UiAction,
+};
 
 /// One live output block.  The notebook's serialized `SavedOutput` is the
 /// on-disk projection; this is the display/runtime representation.
@@ -74,10 +77,21 @@ pub struct CompletionRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DocRequest {
     pub source: String,
+    /// Caret offset when the request was made, echoed by the driver as the
+    /// correlation key.
     pub offset: usize,
+    /// Explicit lookup target: a completion candidate, or the token/callee the
+    /// UI extracted around the caret.  `None` lets the driver extract the
+    /// token at the offset itself.
+    pub name: Option<String>,
+    /// True when the answer belongs to the completion popup's docs-follow
+    /// panel (`pump_completion_docs` issued it) rather than the floating
+    /// Documentation window.
+    pub anchored: bool,
 }
 
-/// The floating documentation window.
+/// The documentation answer.  Either the floating window, or the side panel
+/// that follows the completion popup's selection (`anchored`).
 #[derive(Clone, Debug)]
 pub struct DocPopup {
     pub cell: CellId,
@@ -85,16 +99,34 @@ pub struct DocPopup {
     pub type_name: String,
     pub signature: String,
     pub text: String,
+    /// True while the popup-follows-selection panel owns this answer: it is
+    /// dropped with the popup and never shown as a window.
+    pub anchored: bool,
 }
 
 /// An open Tab-completion popup.  `start..end` is the character range that
 /// accepting the selected candidate will replace.
 #[derive(Clone, Debug)]
 pub struct CompletionPopup {
-    pub items: Vec<String>,
+    pub items: Vec<CompletionItem>,
     pub selected: usize,
     pub start: usize,
     pub end: usize,
+    /// Docs-follow mode: Ctrl+Space over an open popup toggles this, and the
+    /// driver's answers render in a panel to the right of the list.
+    pub docs: bool,
+}
+
+/// An accepted completion staged for the next UI frame: replacing
+/// `start..end` with `text`.  `closes` marks a callable candidate accepted
+/// with auto-close on — the insertion becomes `name()` with the caret
+/// parked between the parentheses.
+#[derive(Clone, Debug)]
+pub struct PendingCompletion {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+    pub closes: bool,
 }
 
 /// Runtime state for one cell.  It is deliberately separate from [`Cell`] so a
@@ -114,8 +146,8 @@ pub struct CellRuntime {
     pub completion_request: Option<CompletionRequest>,
     /// Candidates currently shown in the completion popup.
     pub completion_popup: Option<CompletionPopup>,
-    /// Replacement staged for the next UI frame: (start, end, text).
-    pub pending_completion: Option<(usize, usize, String)>,
+    /// Replacement staged for the next UI frame by an accepted completion.
+    pub pending_completion: Option<PendingCompletion>,
     /// A documentation request sent to the driver and not answered yet.
     pub doc_request: Option<DocRequest>,
 }
@@ -1283,29 +1315,35 @@ impl App {
         self.focus_request = Some(id);
     }
 
-    /// Shift+Enter: run the cell, then select the next cell (Jupyter).  When
-    /// the run cell is the last one, a new cell is inserted below it.
+    /// Shift+Enter: run the cell, then move to the cell below — VSCode-style,
+    /// keyboard focus follows the run, so repeated Shift+Enter walks down the
+    /// notebook (and keeps trailing new cells at the end) instead of
+    /// re-running the same editor.
     fn run_and_advance(&mut self, id: CellId) {
         self.run_cell(id);
         let Some(index) = self.notebook.cell_index(id) else {
             return;
         };
-        match self.notebook.cells.get(index + 1) {
-            Some(next) => self.select_cell(next.id),
-            None => {
-                let new_id = self.notebook.insert_cell_after(Some(id), "");
-                self.cells.insert(new_id, CellRuntime::default());
-                self.select_cell(new_id);
-            }
+        let next_id = self.notebook.cells.get(index + 1).map(|cell| cell.id);
+        if let Some(next_id) = next_id {
+            self.select_cell(next_id);
+            self.focus_request = Some(next_id);
+        } else {
+            let new_id = self.notebook.insert_cell_after(Some(id), "");
+            self.cells.insert(new_id, CellRuntime::default());
+            self.select_cell(new_id);
+            self.focus_request = Some(new_id);
         }
     }
 
-    /// Alt+Enter: run the cell and insert (and select) a new cell below it.
+    /// Alt+Enter: run the cell and insert (and select) a new cell below it,
+    /// landing in its editor.
     fn run_and_insert_below(&mut self, id: CellId) {
         self.run_cell(id);
         let new_id = self.notebook.insert_cell_after(Some(id), "");
         self.cells.insert(new_id, CellRuntime::default());
         self.select_cell(new_id);
+        self.focus_request = Some(new_id);
     }
 
     /// Select `id` and scroll it into view on the next frame.
@@ -1536,7 +1574,7 @@ impl App {
     /// Turn a driver answer into either a direct insertion (one candidate) or
     /// the popup.  Stale answers are dropped: the source must still be exactly
     /// what was sent, and the offset must match.
-    fn apply_completion(&mut self, cell: CellId, offset: usize, items: Vec<String>) {
+    fn apply_completion(&mut self, cell: CellId, offset: usize, items: Vec<CompletionItem>) {
         let Some(rt) = self.cells.get_mut(&cell) else {
             return;
         };
@@ -1555,31 +1593,49 @@ impl App {
             .skip(request.start)
             .take(request.offset - request.start)
             .collect();
-        let mut items: Vec<String> = items
+        let mut items: Vec<CompletionItem> = items
             .into_iter()
-            .filter(|item| !item.is_empty() && *item != current)
+            .filter(|item| !item.name.is_empty() && item.name != current)
             .collect();
-        items.sort();
-        items.dedup();
+        items.sort_by(|a, b| a.name.cmp(&b.name));
+        items.dedup_by(|a, b| a.name == b.name);
         items.truncate(100);
         match items.len() {
             0 => {}
-            1 => rt.pending_completion = Some((request.start, request.offset, items.remove(0))),
+            1 => {
+                let item = items.remove(0);
+                rt.pending_completion = Some(PendingCompletion {
+                    start: request.start,
+                    end: request.offset,
+                    text: item.name,
+                    closes: item.kind.is_callable(),
+                });
+            }
             _ => {
                 rt.completion_popup = Some(CompletionPopup {
                     items,
                     selected: 0,
                     start: request.start,
                     end: request.offset,
+                    docs: false,
                 });
             }
         }
     }
 
-    /// Ask the driver for the docstring of the name at `offset`.  Like
+    /// Ask the driver for documentation.  `name` is the explicit target (a
+    /// completion candidate, or the token/callee the UI extracted around the
+    /// caret); `None` asks the driver to resolve the token at `offset`.  Like
     /// completion, docs share the single driver thread and are suppressed
     /// while a cell is running.
-    fn request_docs(&mut self, cell: CellId, source: String, offset: usize) {
+    fn request_docs(
+        &mut self,
+        cell: CellId,
+        source: String,
+        offset: usize,
+        name: Option<String>,
+        anchored: bool,
+    ) {
         if !self.backend_ready() || self.any_running() {
             return;
         }
@@ -1593,10 +1649,12 @@ impl App {
             rt.doc_request = Some(DocRequest {
                 source: source.clone(),
                 offset,
+                name: name.clone(),
+                anchored,
             });
         }
         let result = match self.backend.as_mut() {
-            Some(backend) => backend.docs(cell, &source, offset),
+            Some(backend) => backend.docs(cell, &source, offset, name.as_deref()),
             None => {
                 if let Some(rt) = self.cells.get_mut(&cell) {
                     rt.doc_request = None;
@@ -1612,8 +1670,65 @@ impl App {
         }
     }
 
-    /// Open the docs window for a driver answer, unless the cell changed since
-    /// the request was made.
+    /// Docs-follow-selection: while a completion popup is open in
+    /// docs-follow mode, keep the panel showing the selected candidate.  Runs
+    /// every frame; issues at most one request at a time and only when the
+    /// shown answer no longer matches the selection.
+    fn pump_completion_docs(&mut self) {
+        let cells: Vec<CellId> = self.cells.keys().copied().collect();
+        for cell in cells {
+            let Some(popup) = self
+                .cells
+                .get(&cell)
+                .and_then(|rt| rt.completion_popup.clone())
+            else {
+                continue;
+            };
+            if !popup.docs {
+                continue;
+            }
+            let Some(item) = popup.items.get(popup.selected) else {
+                continue;
+            };
+            let target = strip_call_paren(&item.name);
+            if target.is_empty() {
+                continue;
+            }
+            let shown = self
+                .doc_popup
+                .as_ref()
+                .filter(|doc| doc.anchored && doc.cell == cell)
+                .is_some_and(|doc| doc.name == target);
+            if shown {
+                continue;
+            }
+            let in_flight = self
+                .cells
+                .get(&cell)
+                .is_some_and(|rt| rt.doc_request.is_some());
+            if in_flight {
+                continue;
+            }
+            let source = self.notebook.cell(cell).map(|c| c.source.clone());
+            if let Some(source) = source {
+                self.request_docs(cell, source, popup.end, Some(target.to_owned()), true);
+            }
+        }
+        // An anchored answer whose popup went away (accepted, closed, or the
+        // source changed) is dropped with it.
+        if let Some(doc) = &self.doc_popup {
+            let open = self
+                .cells
+                .get(&doc.cell)
+                .is_some_and(|rt| rt.completion_popup.as_ref().is_some_and(|popup| popup.docs));
+            if doc.anchored && !open {
+                self.doc_popup = None;
+            }
+        }
+    }
+
+    /// Open the docs window (or refresh the completion-side panel) for a
+    /// driver answer, unless the cell changed since the request was made.
     fn apply_doc(
         &mut self,
         cell: CellId,
@@ -1641,6 +1756,7 @@ impl App {
             type_name,
             signature,
             text,
+            anchored: request.anchored,
         });
     }
 
@@ -2091,7 +2207,8 @@ impl App {
                 cell,
                 source,
                 offset,
-            } => self.request_docs(cell, source, offset),
+                name,
+            } => self.request_docs(cell, source, offset, name, false),
             UiAction::ShowAbout => self.about_open = true,
             UiAction::ShowSettings => self.settings_open = true,
             UiAction::ShowShortcuts => self.shortcuts_open = true,
@@ -2235,7 +2352,31 @@ impl App {
             self.about_open = false;
         }
     }
+}
 
+/// Carbon styling for the settings-dialog sliders.  egui paints the rail with
+/// `widgets.inactive.bg_fill`, which the Carbon palette sets to the button
+/// colour — white on a white modal, i.e. invisible.  Scoped here so the rest
+/// of the app keeps the 32 px control grid and the button visuals.
+///
+/// - Rail: 3 px hairline in the inactive border colour (Gray 40/60).
+/// - Progress: Blue 60/50 (`selection.stroke`) up to the thumb, Carbon-like.
+/// - Thumb: the slider's height is `max(Body text height, interact_size.y)`,
+///   so lowering `interact_size.y` to 18 keeps the height at the text height
+///   and halves the default ~26 px handle.  `weak_bg_fill` (the "15" value
+///   box) and `fg_stroke` (the thumb border) are left untouched.
+fn carbon_slider_style(style: &mut egui::Style) {
+    style.spacing.interact_size.y = 18.0;
+    style.spacing.slider_rail_height = 3.0;
+    let v = &mut style.visuals;
+    let rail = v.widgets.inactive.bg_stroke.color;
+    v.widgets.inactive.bg_fill = rail;
+    let progress = v.selection.stroke.color;
+    v.slider_trailing_fill = true;
+    v.selection.bg_fill = progress;
+}
+
+impl App {
     fn draw_settings_modal(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
@@ -2305,14 +2446,22 @@ impl App {
                 let r = ui.radio_value(&mut self.settings.theme, ThemeMode::Dark, "Dark");
                 changed |= r.changed();
             });
-            let r = ui.add(
-                egui::Slider::new(&mut self.settings.ui_font_size, 12.0..=24.0)
-                    .text("UI font size (pt)"),
-            );
-            changed |= r.changed();
-            let r = ui.add(
-                egui::Slider::new(&mut self.settings.code_font_size, 10.0..=22.0)
-                    .text("Code font size (pt)"),
+            ui.scope(|ui| {
+                carbon_slider_style(ui.style_mut());
+                let r = ui.add(
+                    egui::Slider::new(&mut self.settings.ui_font_size, 12.0..=24.0)
+                        .text("UI font size (pt)"),
+                );
+                changed |= r.changed();
+                let r = ui.add(
+                    egui::Slider::new(&mut self.settings.code_font_size, 10.0..=22.0)
+                        .text("Code font size (pt)"),
+                );
+                changed |= r.changed();
+            });
+            let r = ui.checkbox(
+                &mut self.settings.auto_close_brackets,
+                "Auto-close brackets and quotes",
             );
             changed |= r.changed();
 
@@ -2417,6 +2566,11 @@ impl App {
         let Some(doc) = self.doc_popup.clone() else {
             return;
         };
+        // The anchored answer belongs to the completion popup's side panel,
+        // drawn by `ui::draw_completion_popup`.
+        if doc.anchored {
+            return;
+        }
         let p = if ctx.theme() == egui::Theme::Dark {
             CarbonPalette::dark()
         } else {
@@ -2558,6 +2712,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_startup(ctx);
         self.drain_events();
+        self.pump_completion_docs();
         self.present_native_error(ctx);
         self.handle_close_request(ctx);
         self.handle_shortcuts(ctx);
@@ -2567,7 +2722,6 @@ impl eframe::App for App {
         let running = self.any_running();
         let menu_state = MenuState {
             backend_ready,
-            starting: self.starting,
             running,
             can_run_above: self
                 .last_focused
@@ -2623,6 +2777,8 @@ impl eframe::App for App {
                                 selected: self.selected_cell,
                                 bindings: &self.settings.keybindings,
                                 scroll_to_cell: &mut self.scroll_to_cell,
+                                auto_close: self.settings.auto_close_brackets,
+                                doc: self.doc_popup.clone(),
                             },
                         )
                     })
@@ -2702,87 +2858,14 @@ impl Drop for App {
 
 const LOG_LIMIT: usize = 32 * 1024;
 
-/// Render a plain docstring with light IDE-style formatting: RST section
-/// headings become semi-bold labels, indented/`>>>` blocks are monospaced on a
-/// Gray 10 code surface, and prose is wrapped normally.
-fn draw_doc_text(ui: &mut egui::Ui, text: &str, p: &CarbonPalette) {
-    let text = crate::text::strip_ansi(text);
-    if text.trim().is_empty() {
-        ui.label(egui::RichText::new("No documentation.").color(p.text_helper));
-        return;
-    }
-    let lines: Vec<&str> = text.lines().collect();
-    let is_code = |line: &str| {
-        line.starts_with("    ")
-            || line.starts_with('\t')
-            || line.trim_start().starts_with(">>>")
-            || line.trim_start().starts_with("...")
-    };
-
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        // RST section heading: prose followed by a line of punctuation.
-        if i + 1 < lines.len() && !line.trim().is_empty() {
-            let underline = lines[i + 1].trim();
-            if underline.len() >= 3
-                && underline
-                    .chars()
-                    .all(|ch| matches!(ch, '-' | '=' | '~' | '^' | '"'))
-            {
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(line.trim())
-                        .font(ui::semibold(14.0))
-                        .color(p.text_primary),
-                );
-                i += 2;
-                continue;
-            }
-        }
-        if line.trim().is_empty() {
-            ui.add_space(4.0);
-            i += 1;
-            continue;
-        }
-        if is_code(line) {
-            let mut block = String::new();
-            while i < lines.len() && (is_code(lines[i]) || lines[i].trim().is_empty()) {
-                block.push_str(lines[i].trim_end());
-                block.push('\n');
-                i += 1;
-            }
-            egui::Frame::default()
-                .fill(p.layer)
-                .corner_radius(0.0)
-                .inner_margin(8.0)
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(block.trim_end())
-                                .monospace()
-                                .color(p.text_secondary),
-                        )
-                        .wrap(),
-                    );
-                });
-        } else {
-            let mut block = String::new();
-            while i < lines.len() && !lines[i].trim().is_empty() && !is_code(lines[i]) {
-                block.push_str(lines[i].trim_end());
-                block.push('\n');
-                i += 1;
-            }
-            ui.add(
-                egui::Label::new(egui::RichText::new(block.trim_end()).color(p.text_primary))
-                    .wrap(),
-            );
-        }
-    }
-}
-
 /// How long the first key of a sequence binding (`D D`) stays armed.
 const SEQUENCE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// rlcompleter appends `(` to callables, so `plot(` is the completion text
+/// while `plot` is the name to resolve for documentation.
+pub(crate) fn strip_call_paren(name: &str) -> &str {
+    name.strip_suffix('(').unwrap_or(name)
+}
 
 fn append_log(log: &mut String, line: &str) {
     if !log.is_empty() && !log.ends_with('\n') {
@@ -2869,6 +2952,34 @@ mod tests {
     }
 
     #[test]
+    fn carbon_slider_style_makes_the_rail_visible_and_the_thumb_small() {
+        // Style must come from an already-applied Carbon palette so the
+        // border/selection colours are the real ones.
+        let ctx = egui::Context::default();
+        crate::settings::apply_with_palette(&crate::settings::Settings::default(), &ctx);
+        let mut style = (*ctx.style()).clone();
+        let rail_before = style.visuals.widgets.inactive.bg_fill;
+        carbon_slider_style(&mut style);
+        // Rail: the inactive border colour (Gray 40 light / Gray 60 dark),
+        // not the near-invisible button colour.
+        assert_eq!(
+            style.visuals.widgets.inactive.bg_fill,
+            style.visuals.widgets.inactive.bg_stroke.color
+        );
+        assert_ne!(style.visuals.widgets.inactive.bg_fill, rail_before);
+        // Progress: Blue 60/50 trailing fill up to the thumb.
+        assert!(style.visuals.slider_trailing_fill);
+        assert_eq!(
+            style.visuals.selection.bg_fill,
+            style.visuals.selection.stroke.color
+        );
+        // Thumb: interact height 18 keeps the handle at ~16 px instead of
+        // egui's default ~26 px; rail height 3 is the Carbon hairline.
+        assert_eq!(style.spacing.interact_size.y, 18.0);
+        assert_eq!(style.spacing.slider_rail_height, 3.0);
+    }
+
+    #[test]
     fn active_backend_run_counts_as_running() {
         let id = CellId::new();
         assert!(is_running(Some((id, RunId(7))), &HashMap::new()));
@@ -2937,5 +3048,143 @@ mod tests {
         assert!(log.len() <= LOG_LIMIT);
         assert!(log.contains("line 19999"));
         assert!(!log.contains("line 0\n"));
+    }
+
+    /// An `App` with a one-cell notebook and no backend, for exercising the
+    /// command-mode/action methods headlessly.  `run_cell` logs and returns
+    /// early while the backend is down, which is exactly the path these
+    /// tests take.
+    fn headless_app() -> App {
+        let notebook = Notebook::new("test");
+        let mut cells = HashMap::new();
+        for cell in &notebook.cells {
+            cells.insert(cell.id, CellRuntime::from_saved(cell));
+        }
+        let focus_request = notebook.cells.first().map(|cell| cell.id);
+        App {
+            notebook,
+            cells,
+            backend: None,
+            events: None,
+            backend_alive: false,
+            starting: false,
+            startup_rx: None,
+            startup_pgid: Arc::new(Mutex::new(None)),
+            startup_cancel: Arc::new(Mutex::new(None)),
+            startup_abort: Arc::new(AtomicBool::new(false)),
+            forced_sage: None,
+            install: None,
+            sage_path: None,
+            sage_version: "unknown".into(),
+            active: None,
+            next_run: 1,
+            focus_request,
+            last_focused: None,
+            pending: None,
+            show_unsaved: false,
+            error_dialog: None,
+            about_open: false,
+            allow_close: false,
+            last_title: String::new(),
+            log: String::new(),
+            syntax: SyntaxAssets::new(),
+            renderer: Renderer::new(),
+            show_inspector: true,
+            inspector_vars: Vec::new(),
+            inspector_error: None,
+            inspector_last_request: None,
+            introspect_in_flight: None,
+            doc_popup: None,
+            next_introspect: 1,
+            tokio: None,
+            tokio_handle: None,
+            settings: Settings::default(),
+            settings_open: false,
+            shortcuts_open: false,
+            recording: None,
+            selected_cell: focus_request,
+            scroll_to_cell: None,
+            last_deleted: None,
+            cell_clipboard: None,
+            sequence_pending: None,
+        }
+    }
+
+    #[test]
+    fn run_and_advance_appends_a_cell_at_the_end() {
+        let mut app = headless_app();
+        let id = app.notebook.cells[0].id;
+        app.run_and_advance(id);
+        // Shift+Enter on the last cell appends a new cell below it and moves
+        // selection and keyboard focus there.
+        assert_eq!(app.notebook.cells.len(), 2);
+        let new_id = app.notebook.cells[1].id;
+        assert_ne!(id, new_id);
+        assert_eq!(app.selected_cell, Some(new_id));
+        assert_eq!(app.focus_request, Some(new_id));
+    }
+
+    #[test]
+    fn run_and_advance_focuses_the_next_cell_without_inserting() {
+        let mut app = headless_app();
+        let first = app.notebook.cells[0].id;
+        let second = app.notebook.insert_cell_after(Some(first), "");
+        app.cells.insert(second, CellRuntime::default());
+        app.run_and_advance(first);
+        // Mid-notebook, advancing selects the existing next cell rather than
+        // inserting a new one.
+        assert_eq!(app.notebook.cells.len(), 2);
+        assert_eq!(app.selected_cell, Some(second));
+        assert_eq!(app.focus_request, Some(second));
+    }
+
+    #[test]
+    fn docs_answer_opens_the_floating_window_for_explicit_names() {
+        let mut app = headless_app();
+        let id = app.notebook.cells[0].id;
+        app.notebook.cells[0].source = "integral(sin(x), x)".into();
+        app.cells.get_mut(&id).unwrap().doc_request = Some(DocRequest {
+            source: "integral(sin(x), x)".into(),
+            offset: 9,
+            name: Some("integral".into()),
+            anchored: false,
+        });
+        app.apply_doc(
+            id,
+            9,
+            "integral".into(),
+            "function".into(),
+            "integral(...)".into(),
+            "docs text".into(),
+        );
+        // The answer resolved an explicit name but was not anchored to a
+        // completion popup: it must open the floating Documentation window.
+        let doc = app.doc_popup.as_ref().expect("docs window should open");
+        assert!(!doc.anchored);
+        assert_eq!(doc.name, "integral");
+    }
+
+    #[test]
+    fn anchored_docs_answer_is_only_rendered_by_the_popup_panel() {
+        let mut app = headless_app();
+        let id = app.notebook.cells[0].id;
+        app.notebook.cells[0].source = "plot(".into();
+        app.cells.get_mut(&id).unwrap().doc_request = Some(DocRequest {
+            source: "plot(".into(),
+            offset: 5,
+            name: Some("plot".into()),
+            anchored: true,
+        });
+        app.apply_doc(
+            id,
+            5,
+            "plot".into(),
+            "function".into(),
+            "plot(...)".into(),
+            "docs text".into(),
+        );
+        let doc = app.doc_popup.as_ref().expect("docs answer should be kept");
+        assert!(doc.anchored);
+        assert_eq!(doc.name, "plot");
     }
 }

@@ -175,6 +175,9 @@ enum Command {
         cell: CellId,
         offset: usize,
         source: String,
+        /// Explicit lookup target (caret token or completion candidate);
+        /// `None` lets the driver extract the token at `offset`.
+        name: Option<String>,
     },
     Shutdown {
         done: Sender<()>,
@@ -374,12 +377,19 @@ impl EvalBackend for StdioDriverBackend {
             .map_err(|_| anyhow!("supervisor thread is not running"))
     }
 
-    fn docs(&mut self, cell: CellId, source: &str, offset: usize) -> Result<()> {
+    fn docs(
+        &mut self,
+        cell: CellId,
+        source: &str,
+        offset: usize,
+        name: Option<&str>,
+    ) -> Result<()> {
         self.cmd_tx
             .send(Command::Docs {
                 cell,
                 offset,
                 source: source.to_owned(),
+                name: name.map(str::to_owned),
             })
             .map_err(|_| anyhow!("supervisor thread is not running"))
     }
@@ -541,11 +551,13 @@ impl Supervisor {
                 cell,
                 offset,
                 source,
+                name,
             } => {
                 if let Err(error) = self.write_request(&DriverRequest::Doc {
                     id: cell,
                     offset,
                     source: &source,
+                    name: name.as_deref(),
                 }) {
                     self.emit(BackendEvent::ProtocolWarning {
                         message: format!("documentation request failed: {error:#}"),

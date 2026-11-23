@@ -98,6 +98,55 @@ pub struct VarInfo {
     pub value: String,
 }
 
+/// What a completion candidate resolves to in the live namespace.  `Unknown`
+/// covers an unprobed candidate (driver budget) and any future kind: an old
+/// client must survive a newer driver, never the reverse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompletionKind {
+    Function,
+    Class,
+    Module,
+    Variable,
+    Keyword,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl CompletionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompletionKind::Function => "function",
+            CompletionKind::Class => "class",
+            CompletionKind::Module => "module",
+            CompletionKind::Variable => "variable",
+            CompletionKind::Keyword => "keyword",
+            CompletionKind::Unknown => "unknown",
+        }
+    }
+
+    /// True for kinds the UI treats as callable: accepting such a candidate
+    /// with auto-close on appends `()` and parks the caret inside.
+    pub fn is_callable(self) -> bool {
+        matches!(self, CompletionKind::Function | CompletionKind::Class)
+    }
+}
+
+/// One Tab-completion candidate.  `name` is the clean replacement text (the
+/// rlcompleter `(` suffix on callables is stripped by the driver); `kind`
+/// drives the popup's type icon and the auto-paren decision on accept;
+/// `signature` is the argument list of a callable (parens included, e.g.
+/// `(x, xmin, xmax)`), empty when unknown or not callable.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionItem {
+    pub name: String,
+    #[serde(default)]
+    pub kind: CompletionKind,
+    #[serde(default)]
+    pub signature: String,
+}
+
 /// One protocol frame.
 ///
 /// `#[serde(other)]` makes a newer driver's frame non-fatal: the supervisor
@@ -135,13 +184,15 @@ pub enum Frame {
     },
     /// Prefix-completion candidates for the token ending at `offset` in the
     /// source sent with `{"op":"complete"}`.  `id` echoes the cell id.
+    /// Each item is `{name, kind}` — a bare string is a protocol violation.
     Complete {
         id: CellId,
         offset: usize,
-        items: Vec<String>,
+        items: Vec<CompletionItem>,
     },
     /// Documentation for the name at `offset` in the source sent with
-    /// `{"op":"doc"}`.  `text` is the plain docstring; the UI renders it.
+    /// `{"op":"doc"}` (or for the explicit `name` the request carried).
+    /// `text` is the plain docstring; the UI renders it.
     Doc {
         id: CellId,
         offset: usize,
@@ -204,11 +255,15 @@ pub enum DriverRequest<'a> {
         offset: usize,
         source: &'a str,
     },
-    /// Look up documentation for the dotted identifier ending at `offset`.
+    /// Look up documentation.  The dotted identifier is the explicit `name`
+    /// when the client extracted one (caret target or completion candidate);
+    /// otherwise the driver falls back to the token ending at `offset`.
     Doc {
         id: CellId,
         offset: usize,
         source: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<&'a str>,
     },
     SetDisplay {
         mode: DisplayMode,
@@ -345,10 +400,23 @@ mod tests {
         let f = Frame::Complete {
             id: id(4),
             offset: 7,
-            items: vec!["print(".into(), "println(".into()],
+            items: vec![
+                CompletionItem {
+                    name: "print".into(),
+                    kind: CompletionKind::Function,
+                    signature: "(value, ..., sep=' ', end='\\n')".into(),
+                },
+                CompletionItem {
+                    name: "sorted".into(),
+                    kind: CompletionKind::Function,
+                    signature: String::new(),
+                },
+            ],
         };
         let line = f.to_json_line().unwrap();
         assert!(line.contains(r#""type":"complete""#));
+        assert!(line.contains(r#""kind":"function""#));
+        assert!(line.contains(r#""signature":"(value, ..., sep=' ', end='\\n')""#));
         assert_eq!(Frame::from_json_line(&line).unwrap(), f);
 
         let r = DriverRequest::Complete {
@@ -359,6 +427,20 @@ mod tests {
         let line = r.to_json_line().unwrap();
         assert!(line.contains(r#""op":"complete""#));
         assert!(line.contains(r#""source":"a = pri""#));
+    }
+
+    #[test]
+    fn complete_items_without_kind_parse_to_unknown() {
+        let line = r#"{"type":"complete","id":"00000000-0000-0000-0000-000000000004","offset":7,"items":[{"name":"x"},{"name":"foo","kind":"martian"}]}"#;
+        match Frame::from_json_line(line).unwrap() {
+            Frame::Complete { items, .. } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].name, "x");
+                assert_eq!(items[0].kind, CompletionKind::Unknown);
+                assert_eq!(items[1].kind, CompletionKind::Unknown);
+            }
+            _ => panic!("wrong frame"),
+        }
     }
 
     #[test]
@@ -376,12 +458,25 @@ mod tests {
         assert!(line.contains(r#""kind":"function""#));
         assert_eq!(Frame::from_json_line(&line).unwrap(), f);
 
+        // Caret lookup: no explicit name is sent.
         let r = DriverRequest::Doc {
             id: id(5),
             offset: 3,
             source: "plo",
+            name: None,
         };
         let line = r.to_json_line().unwrap();
         assert!(line.contains(r#""op":"doc""#));
+        assert!(!line.contains(r#""name""#));
+
+        // Candidate lookup: the explicit name rides along.
+        let r = DriverRequest::Doc {
+            id: id(5),
+            offset: 3,
+            source: "plo",
+            name: Some("plot"),
+        };
+        let line = r.to_json_line().unwrap();
+        assert!(line.contains(r#""name":"plot""#));
     }
 }

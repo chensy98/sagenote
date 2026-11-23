@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use driver::{DriverConfig, DriverLaunch, StdioDriverBackend, WakeCallback};
-pub use protocol::{DisplayMode, Frame, MimeBundle, StreamName, VarInfo};
+pub use protocol::{
+    CompletionItem, CompletionKind, DisplayMode, Frame, MimeBundle, StreamName, VarInfo,
+};
 
 /// Stable identity of a cell. UUIDs survive save/load and cell reordering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -153,7 +155,7 @@ pub enum BackendEvent {
     Completion {
         cell: CellId,
         offset: usize,
-        items: Vec<String>,
+        items: Vec<CompletionItem>,
     },
     /// Text on the *process's* stderr (not a user `print(..., file=sys.stderr)`,
     /// which the driver captures into a `stream` frame).
@@ -180,9 +182,11 @@ pub trait EvalBackend {
     /// Prefix/attribute completion for the token ending at `offset`
     /// (characters).  Results arrive as [`BackendEvent::Completion`].
     fn completion(&mut self, cell: CellId, source: &str, offset: usize) -> Result<()>;
-    /// Documentation for the name ending at `offset` (characters).  The answer
-    /// is a `Frame::Doc`, forwarded to the UI.
-    fn docs(&mut self, cell: CellId, source: &str, offset: usize) -> Result<()>;
+    /// Documentation for `name`, or — when `name` is `None` — for the dotted
+    /// identifier ending at `offset` (characters).  The answer is a
+    /// `Frame::Doc`, forwarded to the UI.
+    fn docs(&mut self, cell: CellId, source: &str, offset: usize, name: Option<&str>)
+        -> Result<()>;
     fn declared_mimetypes(&self) -> &[MimeType];
     fn events(&self) -> mpsc::Receiver<BackendEvent>;
 }

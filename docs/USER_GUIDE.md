@@ -24,26 +24,33 @@ dark) and to adjust the UI and code font sizes. Settings are saved to
 
 ## The cell workspace
 
-A notebook is a vertical list of cells. Each cell has:
+A notebook is a vertical list of cells, VSCode-Jupyter style: an execution
+count gutter (`[1]`, `[*]` while running) on the left of the code, and outputs
+below the code. Selecting a cell (click it, or move with the keyboard) shows a
+small floating toolbar above the editor with **Run**, insert below (＋), move
+up (↑), move down (↓) and delete (✕). A 2 px blue accent marks the selected
+or running cell. A "＋ Add cell" button at the bottom appends a new cell.
 
-- A **source editor** — syntax-highlighted Sage code, multi-line
-- An **output panel** — results, stream output, errors, images
-- Per-cell controls — Run, insert below (＋), move up (↑), move down (↓),
-  delete (✕)
-- A **state pill** — idle, queued, running (with elapsed time), ok, error,
-  or interrupted
+### Typing in the editor
 
-A "＋ Add cell" button at the bottom appends a new cell.
+- Typing `(`, `[`, `{`, `"` or `'` **auto-closes the pair** and leaves the
+  caret between the two characters; typing the closing character again skips
+  over it, and Backspace between an empty pair deletes both. Selecting text
+  and typing an opener wraps the selection.
+- This can be turned off in **Settings → Settings…** ("Auto-close brackets
+  and quotes").
 
 ### Tab completion
 
 Press **Tab** while editing to complete the name at the caret:
 
-- One match is inserted immediately (e.g. `pri` → `print(`)
+- One match is inserted immediately (e.g. `pri` → `print`)
 - Several matches open a compact list below the caret; use **↑/↓** or
   **Ctrl+N / Ctrl+P** to move, **Enter** or **Tab** to accept, **Esc** to
   close, or click a row
 - Names may include `.`, so `a.bi` completes the attribute as a whole
+- Accepting a **function or class** also inserts `()` (when auto-close is
+  on) and leaves the caret between the parentheses
 
 Completion is offered for your variables, Sage globals, Python builtins and
 object attributes. It is paused while a cell is running, because Sage is
@@ -54,14 +61,21 @@ executing on the single driver thread.
 With the caret on a name, press **Ctrl+Space** to open a resizable
 **Documentation** window. It shows the name, type, signature and docstring,
 with prose, section headings and code blocks formatted for reading. Press
-**Esc** or the × button to close it.
+**Esc** or the × button to close it. With the caret **inside an argument
+list** (e.g. after `plot(`), Ctrl+Space shows the documentation for the
+function being called.
+
+While a completion list is open, **Ctrl+Space toggles a documentation panel**
+to the right of the list; the panel follows the candidate selection.
 
 The shortcut is remappable in **Settings**, and **Clear** disables it. Docs are
 paused while a cell is running.
 
 ### Running code
 
-- **Shift+Enter** in a cell evaluates it
+- **Shift+Enter** in a cell evaluates it and **moves into the next cell**
+  (or a new cell appended at the end), so repeated Shift+Enter flows down the
+  notebook
 - The **Run** button on a cell evaluates that cell
 - **Run All** (menu or toolbar) evaluates every non-empty cell in order
 - **Run Above** evaluates all cells above the focused one

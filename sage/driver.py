@@ -25,10 +25,12 @@ import base64
 import inspect
 import io
 import json
+import keyword
 import os
 import reprlib
 import rlcompleter
 import sys
+import time
 import traceback
 
 # Framing fd.  Do this before importing Sage: import-time C-level writes to fd 1
@@ -467,12 +469,66 @@ def _completion_token(text):
     return "".join(reversed(token))
 
 
+def _signature(obj):
+    """``inspect.signature(obj)`` as a string, empty when unavailable.
+
+    Wrapped and capped: builtins raise ``ValueError``, Sage's ginac
+    functions can produce a very long spec, and a hostile
+    ``__signature__`` must not break the driver.
+    """
+    try:
+        text = str(inspect.signature(obj))
+    except Exception:
+        return ""
+    return text[:200]
+
+
+def _probe(item):
+    """Probe one completion candidate for its kind and signature.
+
+    The probe is wrapped and budgeted: a hostile ``__getattr__`` must not
+    break the driver, and classification must never cost more than the
+    budget.  Returns ``("unknown", "")`` for anything unresolvable; the
+    signature is the argument list of a callable (parens included), empty
+    when it cannot be produced.
+    """
+    name = item.rstrip("(")
+    if not name:
+        return "unknown", ""
+    if keyword.iskeyword(name):
+        return "keyword", ""
+    try:
+        if "." in name:
+            obj = eval(name, _user_ns)
+        else:
+            obj = _user_ns.get(name)
+    except Exception:
+        return "unknown", ""
+    if obj is None:
+        return "unknown", ""
+    try:
+        if inspect.ismodule(obj):
+            return "module", ""
+        if inspect.isclass(obj):
+            return "class", _signature(obj)
+        if inspect.isroutine(obj) or callable(obj):
+            return "function", _signature(obj)
+    except Exception:
+        return "unknown", ""
+    return "variable", ""
+
+
 def _complete(message):
     """Prefix/attribute completion for one Tab press.
 
     rlcompleter gives us the IDE feel for free: globals, keywords, Python
-    builtins and attributes, with `(` appended to callables.  It is advisory
-    and must never raise, so every probe is wrapped.
+    builtins and attributes.  It is advisory and must never raise, so every
+    probe is wrapped.  Each candidate carries its kind (`function`, `class`,
+    `module`, `variable`, `keyword`) so the popup can draw a type icon and the
+    UI can auto-paren callables on accept; classification is budgeted and
+    falls back to `unknown`.  Candidate names are clean — the rlcompleter
+    `(` suffix on callables is stripped — so the callable signal lives in
+    the kind, not the text.
     """
     cell_id = message.get("id")
     source = message.get("source", "") or ""
@@ -511,18 +567,36 @@ def _complete(message):
             items = []
 
     items.sort()
+    # Probe within a budget; unprobed candidates report `unknown` with no
+    # signature.  The rlcompleter `(` suffix on callables is dropped: the
+    # name is clean and the kind carries the callable signal.
+    deadline = time.monotonic() + 0.5
+    classified = []
+    for item in items:
+        name = item[:-1] if item.endswith("(") else item
+        kind, signature = _probe(item)
+        classified.append({"name": name, "kind": kind, "signature": signature})
+        if time.monotonic() > deadline:
+            classified.extend(
+                {"name": rest, "kind": "unknown", "signature": ""}
+                for rest in items[len(classified) :]
+            )
+            break
     # Attribute probing can technically print (a hostile __getattr__); that is
     # not cell output, so discard it rather than leaking it into the next run.
     _stdout.take()
     _stderr.take()
-    _send({"type": "complete", "id": cell_id, "offset": offset, "items": items})
+    _send({"type": "complete", "id": cell_id, "offset": offset, "items": classified})
 
 
 def _docs(message):
-    """Documentation for the dotted identifier ending at the caret.
+    """Documentation for a name.
 
-    The UI renders the plain docstring; keeping the transport text-only means
-    no HTML/WebView is involved.  Resolution and docstring access are wrapped:
+    The request may carry an explicit ``name`` — a completion candidate, or
+    the token/callee the UI extracted around the caret; otherwise the driver
+    resolves the dotted identifier ending at the offset itself.  The UI
+    renders the plain docstring; keeping the transport text-only means no
+    HTML/WebView is involved.  Resolution and docstring access are wrapped:
     a user object with a hostile descriptor must not break the driver.
     """
     cell_id = message.get("id")
@@ -534,6 +608,9 @@ def _docs(message):
         offset = 0
     offset = max(0, min(offset, len(source)))
     token = _completion_token(source[:offset])
+    # An explicit target wins: the UI may have resolved the enclosing call's
+    # callee (caret inside an argument list) or a completion candidate.
+    token = message.get("name") or token
     name = token
     type_name = ""
     signature = ""

@@ -15,16 +15,18 @@ use std::time::Duration;
 
 use eframe::egui::text::{CCursor, CCursorRange};
 use eframe::egui::{
-    self, Color32, FontId, Key, Modifiers, Response, RichText, Stroke, TextStyle, Ui,
+    self, Color32, Event, FontId, Key, Modifiers, Response, RichText, Stroke, TextStyle, Ui,
 };
-use sagenote::backend::{CellId, DisplayMode, MimeBundle, MimeType, StreamName, VarInfo};
+use sagenote::backend::{
+    CellId, CompletionItem, CompletionKind, DisplayMode, MimeBundle, MimeType, StreamName, VarInfo,
+};
 use sagenote::cells::{Cell, CellState, Notebook};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
-use crate::app::{CellRuntime, LiveOutput};
+use crate::app::{CellRuntime, LiveOutput, PendingCompletion};
 use crate::render::Renderer;
 use crate::settings::CarbonPalette;
 use crate::text::strip_ansi;
@@ -116,12 +118,15 @@ pub enum UiAction {
         offset: usize,
         start: usize,
     },
-    /// Ctrl+Space (or the configured binding): ask the driver for the docstring
-    /// of the name ending at `offset`.
+    /// Ctrl+Space (or the configured binding): ask the driver for
+    /// documentation.  `name` is the target the UI resolved around the caret
+    /// (the token there, or the enclosing call's callee); `None` lets the
+    /// driver resolve the offset itself.
     RequestDocs {
         cell: CellId,
         source: String,
         offset: usize,
+        name: Option<String>,
     },
     RunAll,
     RunAbove(CellId),
@@ -137,7 +142,6 @@ pub enum UiAction {
 
 pub struct MenuState {
     pub backend_ready: bool,
-    pub starting: bool,
     pub running: bool,
     pub can_run_above: bool,
     pub run_above_id: Option<CellId>,
@@ -186,6 +190,11 @@ pub struct NotebookUi<'a> {
     pub selected: Option<CellId>,
     /// Cell to scroll into view this frame.
     pub scroll_to_cell: &'a mut Option<CellId>,
+    /// Auto-close brackets and quotes while typing (Settings).
+    pub auto_close: bool,
+    /// The current documentation answer, for the completion popup's side
+    /// panel.  The floating window is drawn by `App::draw_docs_window`.
+    pub doc: Option<crate::app::DocPopup>,
 }
 
 /// Syntax definitions and themes loaded once at startup.  The fallback editor
@@ -350,12 +359,6 @@ pub fn menu_bar(ctx: &egui::Context, state: &MenuState) -> Vec<UiAction> {
                 widgets.active.bg_stroke = Stroke::NONE;
             }
             egui::menu::bar(ui, |ui| {
-                ui.label(
-                    RichText::new("sagenote")
-                        .font(semibold(15.0))
-                        .color(p.text_primary),
-                );
-                ui.add_space(4.0);
                 ui.menu_button("File", |ui| {
                     menu_item(
                         ui,
@@ -489,29 +492,6 @@ pub fn menu_bar(ctx: &egui::Context, state: &MenuState) -> Vec<UiAction> {
                         &mut actions,
                     );
                 });
-
-                ui.separator();
-                if state.starting {
-                    ui.spinner();
-                    ui.label(RichText::new("Starting Sage…").small().weak());
-                } else {
-                    ui.add_enabled_ui(state.backend_ready, |ui| {
-                        if primary_button(ui, "Run All")
-                            .on_hover_text("Evaluate every non-empty cell")
-                            .clicked()
-                        {
-                            actions.push(UiAction::RunAll);
-                        }
-                    });
-                    ui.add_enabled_ui(state.running, |ui| {
-                        if danger_button(ui, "Interrupt")
-                            .on_hover_text("SIGINT the Sage process group")
-                            .clicked()
-                        {
-                            actions.push(UiAction::Interrupt);
-                        }
-                    });
-                }
             });
         });
     actions
@@ -821,6 +801,8 @@ pub fn notebook_ui(ui: &mut Ui, notebook: &mut Notebook, state: NotebookUi<'_>) 
         bindings,
         selected,
         scroll_to_cell,
+        auto_close,
+        doc,
     } = state;
 
     if notebook.cells.is_empty() {
@@ -847,6 +829,8 @@ pub fn notebook_ui(ui: &mut Ui, notebook: &mut Notebook, state: NotebookUi<'_>) 
             bindings,
             selected,
             scroll_to_cell,
+            auto_close,
+            doc.as_ref(),
         );
         if index + 1 < total {
             ui.add_space(10.0);
@@ -871,6 +855,8 @@ fn draw_cell(
     bindings: &crate::settings::Keybindings,
     selected: Option<CellId>,
     scroll_to_cell: &mut Option<CellId>,
+    auto_close: bool,
+    doc: Option<&crate::app::DocPopup>,
 ) -> bool {
     ui.push_id(cell.id, |ui| {
         let editor_id = egui::Id::new(("sagenote-cell-editor", cell.id.0));
@@ -930,20 +916,29 @@ fn draw_cell(
             }
         }
 
-        // Documentation: Ctrl+Space by default.  It shares the editor-focus
-        // gate with completion and closes an open candidate list first.
+        // Documentation: Ctrl+Space by default.  With the completion popup
+        // open it toggles docs-follow mode instead: the driver's answers
+        // render in a panel beside the candidate list and follow the
+        // selection (`App::pump_completion_docs` issues the requests).
+        // Without a popup, the UI resolves the target around the caret — the
+        // token there, or the enclosing call's callee inside an argument
+        // list — and falls back to the driver's own token extraction.
         if focused && rt.doc_request.is_none() && consume_binding(ui, bindings.get("show_docs")) {
-            let cursor = egui::widgets::text_edit::TextEditState::load(ui.ctx(), editor_id)
-                .and_then(|state| state.cursor.char_range())
-                .filter(|range| range.primary.index == range.secondary.index)
-                .map(|range| range.primary.index)
-                .unwrap_or_else(|| cell.source.chars().count());
-            rt.completion_popup = None;
-            actions.push(UiAction::RequestDocs {
-                cell: cell.id,
-                source: cell.source.clone(),
-                offset: cursor,
-            });
+            if let Some(popup) = rt.completion_popup.as_mut() {
+                popup.docs = !popup.docs;
+            } else {
+                let cursor = egui::widgets::text_edit::TextEditState::load(ui.ctx(), editor_id)
+                    .and_then(|state| state.cursor.char_range())
+                    .filter(|range| range.primary.index == range.secondary.index)
+                    .map(|range| range.primary.index)
+                    .unwrap_or_else(|| cell.source.chars().count());
+                actions.push(UiAction::RequestDocs {
+                    cell: cell.id,
+                    source: cell.source.clone(),
+                    offset: cursor,
+                    name: docs_target(&cell.source, cursor),
+                });
+            }
         }
 
         // Scroll this cell into view when requested (Jupyter `G`/`gg`).
@@ -956,73 +951,121 @@ fn draw_cell(
         // click/Enter in the popup) is applied before the editor is laid out.
         let mut cursor_after: Option<usize> = None;
         let mut source_changed = false;
-        if let Some((start, end, insert)) = rt.pending_completion.take() {
-            let (new_source, new_cursor) = apply_completion(&cell.source, start, end, &insert);
+        if let Some(pending) = rt.pending_completion.take() {
+            // A callable candidate accepted with auto-close on leaves
+            // `plot()` with the caret between the parentheses, exactly as
+            // typing the opener does; otherwise the clean name is inserted.
+            let closes = auto_close && pending.closes;
+            let text = if closes {
+                format!("{}()", pending.text)
+            } else {
+                pending.text
+            };
+            let (new_source, new_cursor) =
+                apply_completion(&cell.source, pending.start, pending.end, &text);
             if new_source != cell.source {
                 cell.source = new_source;
-                cursor_after = Some(new_cursor);
+                cursor_after = Some(if closes {
+                    new_cursor.saturating_sub(1)
+                } else {
+                    new_cursor
+                });
                 source_changed = true;
             }
         }
 
+        // Auto-pair interception (Settings → "Auto-close brackets and
+        // quotes").  Typed openers insert the pair, a closer typed over the
+        // matching closer skips over it, Backspace between an empty pair
+        // deletes both, and a selection is wrapped.  The decision runs on
+        // pure functions below and is applied before the editor is laid
+        // out, reusing the completion machinery for the caret move.
+        if focused && auto_close && rt.completion_popup.is_none() {
+            if let Some(edit) = auto_pair_edit(ui, &cell.source, editor_id) {
+                match edit {
+                    PairEdit::Replace {
+                        start,
+                        end,
+                        text,
+                        cursor,
+                    } => {
+                        let (new_source, _) = apply_completion(&cell.source, start, end, &text);
+                        if new_source != cell.source {
+                            cell.source = new_source;
+                            cursor_after = Some(cursor);
+                            source_changed = true;
+                        }
+                    }
+                    PairEdit::SkipOver { cursor } => {
+                        cursor_after = Some(cursor);
+                    }
+                }
+            }
+        }
+
+        // VSCode-Jupyter chrome: no box.  A 2 px left accent marks the
+        // selected/running cell, the gutter carries the execution count, and
+        // the strip above the editor hosts the small toolbar — only while
+        // the cell is selected.  The strip is always allocated so selection
+        // does not shift the layout.
         let is_selected = selected == Some(cell.id);
-        let border = if is_selected || rt.state == CellState::Running {
+        let accent = if is_selected || rt.state == CellState::Running {
             p.interactive
         } else {
-            p.border_subtle
+            Color32::TRANSPARENT
         };
-        let frame = egui::Frame::default()
-            .fill(p.bg)
-            .stroke(Stroke::new(1.0_f32, border))
-            .corner_radius(0.0)
-            .inner_margin(16.0);
-        frame
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(format!("Cell {}", index + 1))
-                            .font(semibold(14.0))
-                            .color(p.text_primary),
-                    );
-                    ui.add_space(4.0);
-                    state_badge(ui, rt);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("×").on_hover_text("Delete cell").clicked() {
-                            actions.push(UiAction::DeleteCell(cell.id));
-                        }
-                        if ui
-                            .add_enabled(index + 1 < total, egui::Button::new("↓").small())
-                            .on_hover_text("Move down")
+        let cell_top_left = ui.cursor().min;
+        let strip =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
+        if is_selected {
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(strip.0), |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().interact_size = egui::vec2(0.0, 18.0);
+                    ui.spacing_mut().button_padding = egui::vec2(6.0, 1.0);
+                    ui.add_enabled_ui(backend_ready, |ui| {
+                        if strip_button(ui, "Run", true)
+                            .on_hover_text("Evaluate this cell (Shift+Enter)")
                             .clicked()
                         {
-                            actions.push(UiAction::MoveDown(cell.id));
+                            actions.push(UiAction::Run(cell.id));
                         }
-                        if ui
-                            .add_enabled(index > 0, egui::Button::new("↑").small())
-                            .on_hover_text("Move up")
-                            .clicked()
-                        {
-                            actions.push(UiAction::MoveUp(cell.id));
-                        }
-                        if ui
-                            .small_button("+")
-                            .on_hover_text("Insert a cell below")
-                            .clicked()
-                        {
-                            actions.push(UiAction::AddCell(Some(cell.id)));
-                        }
-                        ui.add_enabled_ui(backend_ready, |ui| {
-                            if primary_button(ui, "Run")
-                                .on_hover_text("Evaluate this cell (Shift+Enter)")
-                                .clicked()
-                            {
-                                actions.push(UiAction::Run(cell.id));
-                            }
-                        });
                     });
+                    if strip_button(ui, "+", false)
+                        .on_hover_text("Insert a cell below")
+                        .clicked()
+                    {
+                        actions.push(UiAction::AddCell(Some(cell.id)));
+                    }
+                    if ui
+                        .add_enabled(index > 0, egui::Button::new("↑").small())
+                        .on_hover_text("Move up")
+                        .clicked()
+                    {
+                        actions.push(UiAction::MoveUp(cell.id));
+                    }
+                    if ui
+                        .add_enabled(index + 1 < total, egui::Button::new("↓").small())
+                        .on_hover_text("Move down")
+                        .clicked()
+                    {
+                        actions.push(UiAction::MoveDown(cell.id));
+                    }
+                    if ui
+                        .add_enabled(total > 1, egui::Button::new("×").small())
+                        .on_hover_text("Delete cell")
+                        .clicked()
+                    {
+                        actions.push(UiAction::DeleteCell(cell.id));
+                    }
                 });
+            });
+        }
 
-                ui.add_space(6.0);
+        let edit_changed = ui
+            .horizontal_top(|ui| {
+                let (gutter, _) =
+                    ui.allocate_exact_size(egui::vec2(44.0, 18.0), egui::Sense::hover());
+                paint_gutter(ui, gutter, rt, &p);
                 let width = ui.available_width();
                 let mut layouter = |ui: &Ui, text: &str, wrap_width: f32| {
                     syntax.layout_galley(ui, text, wrap_width)
@@ -1030,7 +1073,7 @@ fn draw_cell(
                 let mut output = egui::TextEdit::multiline(&mut cell.source)
                     .id(editor_id)
                     .code_editor()
-                    .desired_rows(4)
+                    .desired_rows(1)
                     .desired_width(width)
                     .background_color(p.field)
                     .layouter(&mut layouter)
@@ -1058,7 +1101,7 @@ fn draw_cell(
                 }
                 if shift_enter {
                     rt.completion_popup = None;
-                    actions.push(UiAction::Run(cell.id));
+                    actions.push(UiAction::RunAndAdvance(cell.id));
                 }
 
                 if let Some(index) = cursor_after {
@@ -1069,24 +1112,38 @@ fn draw_cell(
                     output.state.store(ui.ctx(), editor_id);
                     output.response.request_focus();
                 } else if rt.completion_popup.is_some() && output.response.has_focus() {
-                    draw_completion_popup(ui, cell.id, rt, &output, focus_request);
+                    draw_completion_popup(ui, cell.id, rt, &output, focus_request, doc);
                 } else if !output.response.has_focus() {
                     rt.completion_popup = None;
                 }
-
-                if rt.has_output()
-                    || rt.error.is_some()
-                    || matches!(
-                        rt.state,
-                        CellState::Running | CellState::Queued | CellState::Interrupted
-                    )
-                {
-                    ui.add_space(8.0);
-                    draw_outputs(ui, rt, renderer);
-                }
                 changed
             })
-            .inner
+            .inner;
+
+        if rt.has_output()
+            || rt.error.is_some()
+            || matches!(
+                rt.state,
+                CellState::Running | CellState::Queued | CellState::Interrupted
+            )
+        {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(44.0);
+                draw_outputs(ui, rt, renderer);
+            });
+        }
+
+        // Left accent: a 2 px Carbon Blue 60 bar on the cell's edge.
+        if accent != Color32::TRANSPARENT {
+            let bottom = ui.cursor().min.y;
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(cell_top_left.x, cell_top_left.y),
+                egui::pos2(cell_top_left.x + 2.0, bottom),
+            );
+            ui.painter().rect_filled(rect, 0.0, accent);
+        }
+        edit_changed
     })
     .inner
 }
@@ -1121,7 +1178,12 @@ fn handle_completion_keys(
     let cancel = ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
     if accept {
         let item = popup.items[popup.selected].clone();
-        rt.pending_completion = Some((popup.start, popup.end, item));
+        rt.pending_completion = Some(PendingCompletion {
+            start: popup.start,
+            end: popup.end,
+            text: item.name,
+            closes: item.kind.is_callable(),
+        });
         rt.completion_popup = None;
         consumed = true;
     } else if cancel {
@@ -1131,30 +1193,30 @@ fn handle_completion_keys(
     consumed
 }
 
-/// Render the completion list just below the caret.  The list is a Carbon
-/// popup: white (or Gray 90) surface, hairline border, square corners.
+/// Render the completion list with its left edge at the token start, so it
+/// stays put while the user types.  Each row carries a small type icon so the
+/// candidate names align in a column.  In docs-follow mode a panel to the
+/// right of the list shows the selected candidate's documentation and
+/// follows the selection.
 fn draw_completion_popup(
     ui: &mut Ui,
     cell: CellId,
     rt: &mut CellRuntime,
     output: &egui::widgets::text_edit::TextEditOutput,
     focus_request: &mut Option<CellId>,
+    doc: Option<&crate::app::DocPopup>,
 ) {
     let Some(mut popup) = rt.completion_popup.take() else {
         return;
     };
     let p = CarbonPalette::of(ui);
-    let cursor = output
-        .state
-        .cursor
-        .char_range()
-        .map(|range| range.sorted()[1].index)
-        .unwrap_or(0);
-    let caret = output.galley.pos_from_ccursor(CCursor::new(cursor));
-    let anchor = output.galley_pos + caret.left_bottom().to_vec2() + egui::vec2(0.0, 4.0);
+    // Anchor at the completed token's start, not at the caret: the left
+    // edge is stable while typing within the token.
+    let token = output.galley.pos_from_ccursor(CCursor::new(popup.start));
+    let anchor = output.galley_pos + token.left_bottom().to_vec2() + egui::vec2(0.0, 4.0);
 
-    let mut chosen: Option<String> = None;
-    egui::Area::new(egui::Id::new(("sagenote-completion", cell.0)))
+    let mut chosen: Option<usize> = None;
+    let list = egui::Area::new(egui::Id::new(("sagenote-completion", cell.0)))
         .order(egui::Order::Foreground)
         .fixed_pos(anchor)
         .constrain(true)
@@ -1171,40 +1233,55 @@ fn draw_completion_popup(
                 })
                 .inner_margin(2.0)
                 .show(ui, |ui| {
-                    // Compact, IDE-like rows: 22 px tall, tight padding,
-                    // 13 px mono.  The global 32 px control height is too
-                    // airy for a completion list.
-                    ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
+                    // Compact, IDE-like rows: 22 px tall, 13 px mono, with
+                    // a 12 px icon column.  The global 32 px control height
+                    // is too airy for a completion list.
                     ui.spacing_mut().interact_size = egui::vec2(0.0, 22.0);
-                    ui.set_min_width(180.0);
-                    ui.set_max_width(320.0);
+                    ui.set_min_width(200.0);
+                    ui.set_max_width(480.0);
                     egui::ScrollArea::vertical()
                         .id_salt(("sagenote-completion-scroll", cell.0))
                         .max_height(180.0)
                         .show(ui, |ui| {
                             for (index, item) in popup.items.iter().enumerate() {
                                 let selected = index == popup.selected;
-                                let text = RichText::new(item)
-                                    .monospace()
-                                    .size(13.0)
-                                    .color(p.text_primary);
-                                let response = ui.add_sized(
-                                    [ui.available_width(), 22.0],
-                                    egui::SelectableLabel::new(selected, text),
-                                );
+                                let hover = if item.signature.is_empty() {
+                                    item.kind.as_str().to_owned()
+                                } else {
+                                    format!("{} {}", item.kind.as_str(), item.signature)
+                                };
+                                let response = ui
+                                    .allocate_response(
+                                        egui::vec2(ui.available_width(), 22.0),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_text(hover);
+                                paint_candidate_row(ui, response.rect, item, selected, &p);
                                 if selected {
                                     response.scroll_to_me(Some(egui::Align::Center));
                                 }
                                 if response.clicked() {
-                                    chosen = Some(item.clone());
+                                    chosen = Some(index);
                                 }
                             }
                         });
-                });
+                })
         });
 
-    if let Some(item) = chosen {
-        rt.pending_completion = Some((popup.start, popup.end, item));
+    if popup.docs {
+        if let Some(doc) = doc.filter(|doc| doc.anchored && doc.cell == cell) {
+            draw_docs_panel(ui.ctx(), list.response.rect, cell, doc, &p);
+        }
+    }
+
+    if let Some(index) = chosen {
+        let item = popup.items[index].clone();
+        rt.pending_completion = Some(PendingCompletion {
+            start: popup.start,
+            end: popup.end,
+            text: item.name,
+            closes: item.kind.is_callable(),
+        });
         *focus_request = Some(cell);
     } else {
         popup.selected = popup.selected.min(popup.items.len().saturating_sub(1));
@@ -1212,32 +1289,312 @@ fn draw_completion_popup(
     }
 }
 
-fn state_badge(ui: &mut Ui, rt: &CellRuntime) {
+/// One completion row: a 12 px kind badge (icon column) and the candidate
+/// name at a fixed x, so the names left-align.  Selected rows get the Carbon
+/// selection fill.
+fn paint_candidate_row(
+    ui: &Ui,
+    rect: egui::Rect,
+    item: &CompletionItem,
+    selected: bool,
+    p: &CarbonPalette,
+) {
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, 0.0, p.selected);
+    }
+    let (glyph, fill) = kind_badge(p, item.kind);
+    let icon = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 12.0, rect.center().y),
+        egui::vec2(12.0, 12.0),
+    );
+    painter.rect_filled(icon, 2.0, fill);
+    if !glyph.is_empty() {
+        painter.text(
+            icon.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            FontId::monospace(9.0),
+            Color32::WHITE,
+        );
+    }
+    let font = FontId::monospace(13.0);
+    let name_rect = painter.text(
+        egui::pos2(rect.left() + 24.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        &item.name,
+        font.clone(),
+        p.text_primary,
+    );
+    if item.signature.is_empty() {
+        return;
+    }
+    let start = name_rect.right() + 6.0;
+    let available = (rect.right() - 6.0 - start).max(0.0);
+    let signature = ellipsize(painter, &item.signature, font.clone(), available);
+    if signature.is_empty() {
+        return;
+    }
+    painter.text(
+        egui::pos2(start, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        &signature,
+        font,
+        p.text_helper,
+    );
+}
+
+/// Truncate `text` with an ellipsis so it fits in `max_width` when rendered
+/// in `font`.  A completion row's signature can be far wider than the popup.
+fn ellipsize(painter: &egui::Painter, text: &str, font: egui::FontId, max_width: f32) -> String {
+    if max_width <= 0.0 {
+        return String::new();
+    }
+    let width = |string: &str| {
+        painter
+            .layout_no_wrap(string.to_owned(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+    };
+    if width(text) <= max_width {
+        return text.to_owned();
+    }
+    let mut cut = text.chars().count();
+    while cut > 1 {
+        let with_ellipsis: String = format!("{}…", text.chars().take(cut).collect::<String>());
+        if width(&with_ellipsis) <= max_width {
+            return with_ellipsis;
+        }
+        cut -= 1;
+    }
+    "…".to_owned()
+}
+
+/// The `[n]` execution-count gutter — VSCode-Jupyter's id number.  `[*]`
+/// while queued/running, `[–]` after an interrupt, `[n]` in the danger colour
+/// for a failed run, and grey when the shown outputs are stale.
+fn paint_gutter(ui: &Ui, rect: egui::Rect, rt: &CellRuntime, p: &CarbonPalette) {
+    let count = match rt.execution_count {
+        Some(n) => format!("[{n}]"),
+        None => "[ ]".to_owned(),
+    };
+    let (text, color) = match rt.state {
+        CellState::Queued | CellState::Running => ("[*]".to_owned(), p.interactive),
+        CellState::Interrupted => ("[–]".to_owned(), p.warning),
+        CellState::Error => (
+            count,
+            if rt.error_stale {
+                p.text_helper
+            } else {
+                p.danger
+            },
+        ),
+        _ => {
+            let stale = rt.outputs.iter().any(|output| {
+                matches!(
+                    output,
+                    LiveOutput::Stream { stale: true, .. } | LiveOutput::Mime { stale: true, .. }
+                )
+            });
+            (
+                count,
+                if stale {
+                    p.text_helper
+                } else {
+                    p.text_secondary
+                },
+            )
+        }
+    };
+    ui.painter().text(
+        egui::pos2(rect.right(), rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        text,
+        FontId::monospace(12.0),
+        color,
+    );
+}
+
+/// Compact 12 px-text strip button for the selected cell's floating toolbar.
+/// `primary` is the Carbon Blue 60 fill used for Run.
+fn strip_button(ui: &mut Ui, label: &str, primary: bool) -> Response {
     let p = CarbonPalette::of(ui);
-    let (label, bg, fg) = match rt.state {
-        CellState::Idle => ("idle", p.layer, p.text_helper),
-        CellState::Queued => ("queued", p.layer, p.interactive),
-        CellState::Running => ("running", p.selected, p.interactive),
-        CellState::Ok => ("ok", p.success_bg, p.success),
-        CellState::Error => ("error", p.danger_bg, p.danger),
-        CellState::Interrupted => ("interrupted", p.warning_bg, p.warning),
-    };
-    let elapsed = if rt.state == CellState::Running {
-        rt.started.map(|started| started.elapsed())
-    } else {
-        rt.elapsed
-    };
-    let text = match elapsed {
-        Some(elapsed) => format!("{label} · {}", format_duration(elapsed)),
-        None => label.to_owned(),
-    };
-    egui::Frame::default()
-        .fill(bg)
-        .corner_radius(2.0)
-        .inner_margin(egui::Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).small().color(fg));
+    ui.scope(|ui| {
+        if primary {
+            let widgets = &mut ui.visuals_mut().widgets;
+            widgets.inactive.weak_bg_fill = p.interactive;
+            widgets.inactive.bg_fill = p.interactive;
+            widgets.inactive.bg_stroke = Stroke::NONE;
+            widgets.inactive.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+            widgets.hovered.weak_bg_fill = p.interactive_hover;
+            widgets.hovered.bg_fill = p.interactive_hover;
+            widgets.hovered.bg_stroke = Stroke::NONE;
+            widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+            widgets.active.weak_bg_fill = p.interactive_active;
+            widgets.active.bg_fill = p.interactive_active;
+            widgets.active.bg_stroke = Stroke::NONE;
+            widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+        }
+        ui.add(egui::Button::new(RichText::new(label).size(12.0)))
+    })
+    .inner
+}
+
+/// The kind badge for a completion candidate: a one-letter glyph and a Carbon
+/// accent colour.  Function reuses the palette's interactive Blue 60.
+fn kind_badge(p: &CarbonPalette, kind: CompletionKind) -> (&'static str, Color32) {
+    match kind {
+        CompletionKind::Function => ("f", p.interactive),
+        CompletionKind::Class => ("c", Color32::from_rgb(0x8a, 0x3f, 0xfc)),
+        CompletionKind::Module => ("m", Color32::from_rgb(0x00, 0x9a, 0x9a)),
+        CompletionKind::Keyword => ("k", Color32::from_rgb(0xd1, 0x27, 0x65)),
+        CompletionKind::Variable => ("v", Color32::from_rgb(0x78, 0x78, 0x78)),
+        CompletionKind::Unknown => ("", Color32::from_rgb(0xa8, 0xa8, 0xa8)),
+    }
+}
+
+/// The docs-follow panel: the selected candidate's documentation, anchored to
+/// the right of the completion list and redrawn as the selection moves.
+fn draw_docs_panel(
+    ctx: &egui::Context,
+    list: egui::Rect,
+    cell: CellId,
+    doc: &crate::app::DocPopup,
+    p: &CarbonPalette,
+) {
+    let pos = egui::pos2(list.right() + 8.0, list.top());
+    egui::Area::new(egui::Id::new(("sagenote-completion-docs", cell.0)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .constrain(true)
+        .show(ctx, |ui| {
+            egui::Frame::default()
+                .fill(p.bg)
+                .stroke(Stroke::new(1.0_f32, p.border_strong))
+                .corner_radius(0.0)
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 4],
+                    blur: 12,
+                    spread: 0,
+                    color: Color32::from_black_alpha(if p.dark_mode { 120 } else { 36 }),
+                })
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.set_min_width(320.0);
+                    ui.set_max_width(440.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(&doc.name)
+                                .font(semibold(14.0))
+                                .color(p.text_primary),
+                        );
+                        if !doc.type_name.is_empty() {
+                            ui.label(RichText::new(&doc.type_name).small().color(p.text_helper));
+                        }
+                    });
+                    if !doc.signature.is_empty() {
+                        ui.add_space(4.0);
+                        egui::Frame::default()
+                            .fill(p.layer)
+                            .corner_radius(0.0)
+                            .inner_margin(8.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&doc.signature)
+                                            .monospace()
+                                            .color(p.text_secondary),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                    }
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt(("sagenote-completion-docs-body", cell.0))
+                        .max_height(220.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            draw_doc_text(ui, &doc.text, p);
+                        });
+                });
         });
+}
+
+/// Render a plain docstring with light IDE-style formatting: RST section
+/// headings become semi-bold labels, indented/`>>>` blocks are monospaced on a
+/// Gray 10 code surface, and prose is wrapped normally.
+pub(crate) fn draw_doc_text(ui: &mut Ui, text: &str, p: &CarbonPalette) {
+    let text = strip_ansi(text);
+    if text.trim().is_empty() {
+        ui.label(RichText::new("No documentation.").color(p.text_helper));
+        return;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let is_code = |line: &str| {
+        line.starts_with("    ")
+            || line.starts_with('\t')
+            || line.trim_start().starts_with(">>>")
+            || line.trim_start().starts_with("...")
+    };
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        // RST section heading: prose followed by a line of punctuation.
+        if i + 1 < lines.len() && !line.trim().is_empty() {
+            let underline = lines[i + 1].trim();
+            if underline.len() >= 3
+                && underline
+                    .chars()
+                    .all(|ch| matches!(ch, '-' | '=' | '~' | '^' | '"'))
+            {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(line.trim())
+                        .font(semibold(14.0))
+                        .color(p.text_primary),
+                );
+                i += 2;
+                continue;
+            }
+        }
+        if line.trim().is_empty() {
+            ui.add_space(4.0);
+            i += 1;
+            continue;
+        }
+        if is_code(line) {
+            let mut block = String::new();
+            while i < lines.len() && (is_code(lines[i]) || lines[i].trim().is_empty()) {
+                block.push_str(lines[i].trim_end());
+                block.push('\n');
+                i += 1;
+            }
+            egui::Frame::default()
+                .fill(p.layer)
+                .corner_radius(0.0)
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(block.trim_end())
+                                .monospace()
+                                .color(p.text_secondary),
+                        )
+                        .wrap(),
+                    );
+                });
+        } else {
+            let mut block = String::new();
+            while i < lines.len() && !lines[i].trim().is_empty() && !is_code(lines[i]) {
+                block.push_str(lines[i].trim_end());
+                block.push('\n');
+                i += 1;
+            }
+            ui.add(egui::Label::new(RichText::new(block.trim_end()).color(p.text_primary)).wrap());
+        }
+    }
 }
 
 fn draw_outputs(ui: &mut Ui, rt: &CellRuntime, renderer: &mut Renderer) {
@@ -1345,15 +1702,20 @@ fn draw_live_output(ui: &mut Ui, output: &LiveOutput, renderer: &mut Renderer) {
                 }
                 return;
             };
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(mime.as_str()).small().weak());
-                if *display == DisplayMode::Inline {
-                    ui.label(RichText::new("inline").small().weak());
-                }
-                if *stale {
-                    stale_tag(ui);
-                }
-            });
+            // The transport mimetype is protocol plumbing, not something the
+            // reader needs: rendered results carry no mime tag.  The tag row
+            // survives only for the `inline` display mode and `stale`.
+            let inline = *display == DisplayMode::Inline;
+            if inline || *stale {
+                ui.horizontal_wrapped(|ui| {
+                    if inline {
+                        ui.label(RichText::new("inline").small().weak());
+                    }
+                    if *stale {
+                        stale_tag(ui);
+                    }
+                });
+            }
             match mime {
                 MimeType::TextPlain => {
                     let data = strip_ansi(data);
@@ -1544,6 +1906,211 @@ pub fn completion_token_start(source: &str, cursor: usize) -> usize {
     start
 }
 
+/// The documentation target around the caret: the dotted identifier ending
+/// there, or — when the caret sits in an argument list with no token — the
+/// innermost enclosing call's callee.  `None` when nothing is identifiable;
+/// the driver then resolves the token at the offset itself.
+pub fn docs_target(source: &str, caret: usize) -> Option<String> {
+    let chars: Vec<char> = source.chars().collect();
+    let caret = caret.min(chars.len());
+    let start = completion_token_start(source, caret);
+    if start < caret {
+        return Some(chars[start..caret].iter().collect());
+    }
+    // No token at the caret: scan back to the innermost unclosed bracket,
+    // skipping balanced pairs, and take the dotted identifier before it.
+    let mut depth = 0usize;
+    let mut i = caret;
+    while i > 0 {
+        i -= 1;
+        match chars[i] {
+            ')' | ']' | '}' => depth += 1,
+            '(' | '[' | '{' => {
+                if depth > 0 {
+                    depth -= 1;
+                    continue;
+                }
+                let mut end = i;
+                while end > 0 && chars[end - 1].is_whitespace() {
+                    end -= 1;
+                }
+                let mut start = end;
+                while start > 0
+                    && (chars[start - 1].is_alphanumeric()
+                        || chars[start - 1] == '_'
+                        || chars[start - 1] == '.')
+                {
+                    start -= 1;
+                }
+                if start < end {
+                    return Some(chars[start..end].iter().collect());
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Bracket and quote pairs that auto-close while typing.
+const PAIRS: &[(char, char)] = &[('(', ')'), ('[', ']'), ('{', '}'), ('"', '"'), ('\'', '\'')];
+
+/// The outcome of one intercepted auto-pair event, expressed as a
+/// `apply_completion`-style edit so the editor's staged-caret machinery is
+/// reused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PairEdit {
+    /// Replace `start..end` (characters) with `text`; the caret ends at
+    /// `cursor`.
+    Replace {
+        start: usize,
+        end: usize,
+        text: String,
+        cursor: usize,
+    },
+    /// Only move the caret (typing a closer over the same closer).
+    SkipOver { cursor: usize },
+}
+
+/// Pure decision for one typed character.  `head`/`anchor` are the (possibly
+/// unordered) cursor positions in characters.  An opener inserts the pair;
+/// with a selection it wraps instead.  A quote only closes when it would not
+/// glue onto a word character (apostrophes inside words stay untouched).
+pub fn auto_pair_on_text(
+    source: &str,
+    head: usize,
+    anchor: usize,
+    typed: &str,
+) -> Option<PairEdit> {
+    let mut chars_of = typed.chars();
+    let ch = chars_of.next()?;
+    // One character per event; multi-character (IME) events pass through.
+    if chars_of.next().is_some() {
+        return None;
+    }
+    let chars: Vec<char> = source.chars().collect();
+    let head = head.min(chars.len());
+    let anchor = anchor.min(chars.len());
+    let (sel_min, sel_max) = if head <= anchor {
+        (head, anchor)
+    } else {
+        (anchor, head)
+    };
+
+    // Typing a closer over the same closer skips over it.
+    if PAIRS
+        .iter()
+        .any(|(_, close)| *close == ch && chars.get(head).copied() == Some(ch))
+    {
+        return Some(PairEdit::SkipOver { cursor: head + 1 });
+    }
+
+    // Typing an opener inserts the pair (quotes only when the previous
+    // character would not read as an apostrophe inside a word: `dont` stays
+    // plain, `s = 'x` closes its string).
+    let close = PAIRS
+        .iter()
+        .find(|(open, _)| *open == ch)
+        .map(|(_, c)| *c)?;
+    if (ch == '"' || ch == '\'')
+        && head > 0
+        && (chars[head - 1].is_alphanumeric() || chars[head - 1] == '_')
+    {
+        return None;
+    }
+    if head != anchor {
+        // Wrap the selection in the pair.
+        let selected: String = chars[sel_min..sel_max].iter().collect();
+        Some(PairEdit::Replace {
+            start: sel_min,
+            end: sel_max,
+            text: format!("{ch}{selected}{close}"),
+            cursor: sel_max + 2,
+        })
+    } else {
+        Some(PairEdit::Replace {
+            start: head,
+            end: head,
+            text: format!("{ch}{close}"),
+            cursor: head + 1,
+        })
+    }
+}
+
+/// Pure decision for Backspace: delete an empty pair around the caret.
+pub fn auto_pair_on_backspace(source: &str, caret: usize) -> Option<PairEdit> {
+    let chars: Vec<char> = source.chars().collect();
+    let caret = caret.min(chars.len());
+    if caret == 0 || caret >= chars.len() {
+        return None;
+    }
+    let before = chars[caret - 1];
+    let after = chars[caret];
+    if PAIRS
+        .iter()
+        .any(|(open, close)| *open == before && *close == after)
+    {
+        return Some(PairEdit::Replace {
+            start: caret - 1,
+            end: caret + 1,
+            text: String::new(),
+            cursor: caret - 1,
+        });
+    }
+    None
+}
+
+/// Consume one focused-editor input event and decide the pair edit for it.
+/// Backspace is peeked first and consumed only when a pair deletes; text
+/// events are removed only when a rule fires, so ordinary typing reaches the
+/// editor untouched.
+fn auto_pair_edit(ui: &mut Ui, source: &str, editor_id: egui::Id) -> Option<PairEdit> {
+    let (head, anchor) = egui::widgets::text_edit::TextEditState::load(ui.ctx(), editor_id)
+        .and_then(|state| state.cursor.char_range())
+        .map(|range| (range.primary.index, range.secondary.index))?;
+    let mut edit: Option<PairEdit> = None;
+    ui.input_mut(|input| {
+        input.events.retain(|event| {
+            if edit.is_some() {
+                return true;
+            }
+            let Event::Text(text) = event else {
+                return true;
+            };
+            match auto_pair_on_text(source, head, anchor, text) {
+                Some(pair_edit) => {
+                    edit = Some(pair_edit);
+                    false
+                }
+                None => true,
+            }
+        });
+    });
+    if edit.is_none() && head == anchor {
+        let backspace = ui.input(|input| {
+            input.modifiers.is_none()
+                && input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        Event::Key {
+                            key: Key::Backspace,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                })
+        });
+        if backspace {
+            if let Some(pair_edit) = auto_pair_on_backspace(source, head) {
+                ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Backspace));
+                edit = Some(pair_edit);
+            }
+        }
+    }
+    edit
+}
+
 /// Replace the character range `[start, end)` with `insert`, returning the new
 /// source and the caret position (in characters) after the insertion.
 pub fn apply_completion(source: &str, start: usize, end: usize, insert: &str) -> (String, usize) {
@@ -1585,6 +2152,7 @@ fn display_path(path: &Path, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::CompletionPopup;
 
     #[test]
     fn durations_are_human_readable() {
@@ -1620,6 +2188,68 @@ mod tests {
         assert_eq!(completion_token_start("x = ", 4), 4);
         // Characters, not bytes: the token starts after the non-ASCII prefix.
         assert_eq!(completion_token_start("π + si", 6), 4);
+    }
+
+    #[test]
+    fn docs_target_finds_the_token_and_the_enclosing_callee() {
+        // Token ending at the caret wins.
+        assert_eq!(docs_target("pri", 3), Some("pri".into()));
+        assert_eq!(docs_target("a.bi", 4), Some("a.bi".into()));
+        assert_eq!(docs_target("", 0), None);
+        // Caret inside an argument list: resolve the innermost call's callee.
+        assert_eq!(docs_target("plot(x, ", 8), Some("plot".into()));
+        assert_eq!(docs_target("matrix(R, )", 10), Some("matrix".into()));
+        // Nested calls: the innermost open bracket wins.
+        assert_eq!(docs_target("f(g(h(a,", 8), Some("h".into()));
+    }
+
+    #[test]
+    fn auto_pairs_close_wrap_and_skip() {
+        // Opener inserts the pair, caret between.
+        assert_eq!(
+            auto_pair_on_text("x = 1", 4, 4, "("),
+            Some(PairEdit::Replace {
+                start: 4,
+                end: 4,
+                text: "()".into(),
+                cursor: 5,
+            })
+        );
+        // Selection is wrapped.
+        assert_eq!(
+            auto_pair_on_text("x = abc", 4, 7, "("),
+            Some(PairEdit::Replace {
+                start: 4,
+                end: 7,
+                text: "(abc)".into(),
+                cursor: 9,
+            })
+        );
+        // A closer typed over the same closer skips over it.
+        assert_eq!(
+            auto_pair_on_text("f(x)", 3, 3, ")"),
+            Some(PairEdit::SkipOver { cursor: 4 })
+        );
+        // Quotes do not glue onto a word character (apostrophes).
+        assert_eq!(auto_pair_on_text("dont", 4, 4, "'"), None);
+        // Ordinary identifiers are untouched.
+        assert_eq!(auto_pair_on_text("x = a", 5, 5, "a"), None);
+    }
+
+    #[test]
+    fn auto_pair_backspace_deletes_the_empty_pair() {
+        assert_eq!(
+            auto_pair_on_backspace("f()", 2),
+            Some(PairEdit::Replace {
+                start: 1,
+                end: 3,
+                text: String::new(),
+                cursor: 1,
+            })
+        );
+        // Not an empty pair: no edit.
+        assert_eq!(auto_pair_on_backspace("f(a)", 3), None);
+        assert_eq!(auto_pair_on_backspace("f()", 0), None);
     }
 
     #[test]
@@ -1705,6 +2335,8 @@ mod tests {
                         bindings: &crate::settings::Keybindings::jupyter(),
                         selected: None,
                         scroll_to_cell: &mut None,
+                        auto_close: true,
+                        doc: None,
                     },
                 );
             });
@@ -1812,7 +2444,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_enter_runs_the_focused_editor() {
+    fn shift_enter_runs_the_focused_editor_and_advances() {
         let mut notebook = Notebook::new("test");
         let id = notebook.cells[0].id;
         notebook.cells[0].source = "1+1".into();
@@ -1862,9 +2494,152 @@ mod tests {
             input,
         );
         assert!(
-            actions.contains(&UiAction::Run(id)),
-            "Shift+Enter should queue a Run action, got {actions:?}"
+            actions.contains(&UiAction::RunAndAdvance(id)),
+            "Shift+Enter should queue a RunAndAdvance action, got {actions:?}"
         );
+    }
+
+    #[test]
+    fn ctrl_space_inside_a_call_requests_docs_for_the_callee() {
+        let mut notebook = Notebook::new("test");
+        let id = notebook.cells[0].id;
+        notebook.cells[0].source = "integral(sin(x), x)".into();
+        let mut runtime = HashMap::new();
+        runtime.insert(id, CellRuntime::default());
+        let mut focus = Some(id);
+        let mut last = None;
+        let mut actions = Vec::new();
+        let syntax = SyntaxAssets::new();
+        let mut renderer = Renderer::new();
+        let ctx = test_context();
+        // Frame one grants focus to the editor.
+        draw_notebook_frame(
+            &ctx,
+            &mut notebook,
+            &mut runtime,
+            &mut focus,
+            &mut last,
+            &syntax,
+            &mut renderer,
+            &mut actions,
+            test_input(),
+        );
+        // Place the caret just after `integral(`, inside the argument list.
+        let editor_id = egui::Id::new(("sagenote-cell-editor", id.0));
+        if let Some(mut state) = egui::widgets::text_edit::TextEditState::load(&ctx, editor_id) {
+            state
+                .cursor
+                .set_char_range(Some(CCursorRange::one(CCursor::new(9))));
+            state.store(&ctx, editor_id);
+        }
+        actions.clear();
+        // Frame two sends Ctrl+Space.
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::CTRL,
+            }],
+            modifiers: Modifiers::CTRL,
+            ..test_input()
+        };
+        draw_notebook_frame(
+            &ctx,
+            &mut notebook,
+            &mut runtime,
+            &mut focus,
+            &mut last,
+            &syntax,
+            &mut renderer,
+            &mut actions,
+            input,
+        );
+        // The UI resolved the enclosing call's callee as the explicit target.
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                UiAction::RequestDocs {
+                    cell: c,
+                    name: Some(name),
+                    ..
+                } if *c == id && name == "integral"
+            )),
+            "Ctrl+Space should request docs for the callee, got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn accepting_a_callable_completion_parks_the_caret_inside_the_pair() {
+        let mut notebook = Notebook::new("test");
+        let id = notebook.cells[0].id;
+        notebook.cells[0].source = "a = pri".into();
+        let mut runtime = HashMap::new();
+        let rt = CellRuntime {
+            completion_popup: Some(CompletionPopup {
+                items: vec![CompletionItem {
+                    name: "print".into(),
+                    kind: CompletionKind::Function,
+                    signature: "(value, ..., sep=' ', end='\\n')".into(),
+                }],
+                selected: 0,
+                start: 4,
+                end: 7,
+                docs: false,
+            }),
+            ..Default::default()
+        };
+        runtime.insert(id, rt);
+        let mut focus = Some(id);
+        let mut last = None;
+        let mut actions = Vec::new();
+        let syntax = SyntaxAssets::new();
+        let mut renderer = Renderer::new();
+        let ctx = test_context();
+        // Frame one grants focus to the editor.
+        draw_notebook_frame(
+            &ctx,
+            &mut notebook,
+            &mut runtime,
+            &mut focus,
+            &mut last,
+            &syntax,
+            &mut renderer,
+            &mut actions,
+            test_input(),
+        );
+        actions.clear();
+        // Frame two sends Enter to accept the candidate.
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            modifiers: Modifiers::NONE,
+            ..test_input()
+        };
+        draw_notebook_frame(
+            &ctx,
+            &mut notebook,
+            &mut runtime,
+            &mut focus,
+            &mut last,
+            &syntax,
+            &mut renderer,
+            &mut actions,
+            input,
+        );
+        // The accepted callable leaves `print()` with the caret between the parens.
+        assert_eq!(notebook.cells[0].source, "a = print()");
+        let editor_id = egui::Id::new(("sagenote-cell-editor", id.0));
+        let cursor = egui::widgets::text_edit::TextEditState::load(&ctx, editor_id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| range.primary.index);
+        assert_eq!(cursor, Some(10));
     }
 
     #[test]
@@ -1872,7 +2647,6 @@ mod tests {
         let ctx = test_context();
         let menu = MenuState {
             backend_ready: true,
-            starting: false,
             running: false,
             can_run_above: true,
             run_above_id: Some(CellId::new()),

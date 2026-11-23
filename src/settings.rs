@@ -855,6 +855,8 @@ pub struct Settings {
     pub code_font_size: f32,
     /// Inspector auto-refresh interval in seconds; 0 disables auto-refresh.
     pub inspector_refresh_secs: u64,
+    /// Typing an opener inserts the pair and skips over the closer.
+    pub auto_close_brackets: bool,
     pub keybindings: Keybindings,
 }
 
@@ -867,6 +869,7 @@ impl Default for Settings {
             ui_font_size: 15.0,
             code_font_size: 14.0,
             inspector_refresh_secs: 2,
+            auto_close_brackets: true,
             keybindings: Keybindings::default(),
         }
     }

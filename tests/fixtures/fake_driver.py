@@ -121,11 +121,22 @@ def introspect(request_id):
     )
 
 
-_COMPLETIONS = ["print(", "println(", "property("]
+_COMPLETIONS = [
+    {
+        "name": "print",
+        "kind": "function",
+        "signature": "(value, ..., sep=' ', end='\\n')",
+    },
+    {"name": "println", "kind": "function", "signature": "(value, ...)"},
+    {
+        "name": "property",
+        "kind": "function",
+        "signature": "(fget=None, fset=None, fdel=None, doc=None)",
+    },
+]
 
 
-def complete(cell_id, source, offset):
-    """Canned prefix completion, enough to exercise Tab end to end."""
+def _token_at(source, offset):
     text = source[:offset]
     token = []
     for ch in reversed(text):
@@ -133,24 +144,22 @@ def complete(cell_id, source, offset):
             token.append(ch)
         else:
             break
-    token = "".join(reversed(token))
+    return "".join(reversed(token))
+
+
+def complete(cell_id, source, offset):
+    """Canned prefix completion, enough to exercise Tab end to end."""
+    token = _token_at(source, offset)
     if token and not token.startswith("."):
-        items = [item for item in _COMPLETIONS if item.startswith(token)]
+        items = [item for item in _COMPLETIONS if item["name"].startswith(token)]
     else:
         items = []
     send({"type": "complete", "id": cell_id, "offset": offset, "items": items})
 
 
-def docs(cell_id, source, offset):
-    """Canned documentation for the name at the caret."""
-    text = source[:offset]
-    token = []
-    for ch in reversed(text):
-        if ch.isalnum() or ch == "_" or ch == ".":
-            token.append(ch)
-        else:
-            break
-    token = "".join(reversed(token))
+def docs(cell_id, source, offset, name=None):
+    """Canned documentation for the name at the caret (or the explicit name)."""
+    token = name or _token_at(source, offset)
     send(
         {
             "type": "doc",
@@ -159,7 +168,7 @@ def docs(cell_id, source, offset):
             "name": token,
             "kind": "function",
             "signature": "print(value, ..., sep=' ', end='\\n')",
-            "text": "Print `value` to the text stream.\n\nCanned documentation from the fake driver.",
+            "text": f"Print `{token}` to the text stream.\n\nCanned documentation from the fake driver.",
         }
     )
 
@@ -183,7 +192,12 @@ def main():
         elif op == "complete":
             complete(message["id"], message.get("source", ""), message.get("offset", 0))
         elif op == "doc":
-            docs(message["id"], message.get("source", ""), message.get("offset", 0))
+            docs(
+                message["id"],
+                message.get("source", ""),
+                message.get("offset", 0),
+                message.get("name"),
+            )
         elif op == "set_display":
             mode = message.get("mode", "block")
             if mode in ("block", "inline"):

@@ -13,7 +13,7 @@ per line, Jupyter-shaped:
 | `result` | `id`, `run`, `bundle`, `display`: `block`/`inline` |
 | `error` | `id`, `run`, `traceback` |
 | `introspect` | `id`, `vars`: `[{name,type,value}]` |
-| `complete` | `id`, `offset`, `items`: candidate strings for the token at `offset` |
+| `complete` | `id`, `offset`, `items`: `[{name,kind,signature}]` candidates for the token at `offset`; `kind` is `function`\|`class`\|`module`\|`variable`\|`keyword`\|`unknown`; `signature` is the callable's argument list, parens included, empty when unknown. Names are clean — no rlcompleter `(` suffix — and the kind carries the callable signal |
 | `doc` | `id`, `offset`, `name`, `kind`, `signature`, `text`: docstring for the name |
 | `end` | `id`, `run` |
 | `pong` | auxiliary liveness answer to `ping`; never cell output |
@@ -26,8 +26,11 @@ the session.
 Stdin requests: `{"op":"eval"|"introspect"|"complete"|"doc"|"set_display"|"ping"}`.
 `set_display` carries `mode`: `block`|`inline`. `complete` and `doc` carry the
 cell `id`, the whole cell `source`, and the caret `offset` in characters; the
-driver extracts the dotted identifier ending there. `doc` returns the plain
-docstring plus name/kind/signature; the UI renders it (no HTML/WebView).
+driver extracts the dotted identifier ending there. `doc` may additionally
+carry an explicit `name` — a completion candidate, or the token/callee the UI
+resolved around the caret — which wins over the driver's own extraction. `doc`
+returns the plain docstring plus name/kind/signature; the UI renders it (no
+HTML/WebView).
 
 ## Framing rationale
 

@@ -267,10 +267,16 @@ fn introspection_and_completion() {
             matches!(
                 e,
                 BackendEvent::Completion { cell: c, offset: 3, items }
-                    if *c == cell && items.iter().any(|item| item == "print(")
+                    if *c == cell && items.iter().any(|item| item.name == "print")
             )
         })
     });
+    // The candidate's signature rides along on the Complete frame.
+    assert!(events.iter().any(|e| matches!(
+        e,
+        BackendEvent::Completion { items, .. }
+            if items.iter().any(|item| item.name == "print" && item.signature.starts_with('('))
+    )));
     assert!(events.iter().any(|e| matches!(
         e,
         BackendEvent::Completion { items, .. } if items.len() >= 2
@@ -282,7 +288,7 @@ fn documentation_is_forwarded_as_a_frame() {
     let mut backend = backend(Duration::from_secs(2));
     let rx = backend.events();
     let cell = CellId::new();
-    backend.docs(cell, "pri", 3).unwrap();
+    backend.docs(cell, "pri", 3, None).unwrap();
     let events = collect_until(&rx, Duration::from_secs(5), |events| {
         events.iter().any(|e| {
             matches!(
@@ -296,6 +302,27 @@ fn documentation_is_forwarded_as_a_frame() {
         e,
         BackendEvent::Frame(Frame::Doc { text, signature, .. })
             if text.contains("Print") && signature.contains("print")
+    )));
+}
+
+#[test]
+fn named_documentation_lookup_round_trips() {
+    let mut backend = backend(Duration::from_secs(2));
+    let rx = backend.events();
+    let cell = CellId::new();
+    backend.docs(cell, "pri", 3, Some("plot")).unwrap();
+    let events = collect_until(&rx, Duration::from_secs(5), |events| {
+        events.iter().any(|e| {
+            matches!(
+                e,
+                BackendEvent::Frame(Frame::Doc { id, name, .. })
+                    if *id == cell && name == "plot"
+            )
+        })
+    });
+    assert!(events.iter().any(|e| matches!(
+        e,
+        BackendEvent::Frame(Frame::Doc { text, .. }) if text.contains("plot")
     )));
 }
 
