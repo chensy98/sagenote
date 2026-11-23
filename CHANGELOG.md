@@ -5,6 +5,8 @@ All notable changes to sagenote are documented here. Versions follow
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-23
+
 ### Added
 
 - VSCode-Jupyter cell chrome: no box, a `[n]` execution-count gutter, a 2 px
